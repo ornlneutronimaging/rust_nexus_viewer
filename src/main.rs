@@ -2,6 +2,7 @@
 //! the right, with a search bar to narrow the tree down to matching PVs.
 
 mod h5io;
+mod recent;
 mod theme;
 
 use eframe::egui;
@@ -25,6 +26,7 @@ fn main() -> eframe::Result {
             // Saved light/dark preference, shared by all the VENUS rust tools.
             cc.egui_ctx.set_theme(theme::load());
             let mut app = App::default();
+            app.recent = recent::load();
             if let Some(p) = &arg_path {
                 app.open_file(p, &cc.egui_ctx);
             }
@@ -105,6 +107,8 @@ struct App {
     swap_xy: bool,
     normalize: bool,
     xy_cache: Option<XyCache>,
+    /// Most-recently opened files, newest first (persisted across restarts).
+    recent: Vec<PathBuf>,
 }
 
 impl App {
@@ -123,6 +127,7 @@ impl App {
                 self.loaded2 = None;
                 self.xy_cache = None;
                 self.computed_for = None;
+                recent::add(&mut self.recent, path);
             }
             Err(e) => self.error = Some(format!("{e:#}")),
         }
@@ -132,10 +137,15 @@ impl App {
         let mut dialog = rfd::FileDialog::new()
             .add_filter("NeXus / HDF5", &["h5", "nxs", "hdf5", "nx5", "nxs.h5"])
             .add_filter("All files", &["*"]);
-        if let Some(tree) = &self.tree {
-            if let Some(dir) = tree.file_path.parent() {
-                dialog = dialog.set_directory(dir);
-            }
+        // Start in the current file's directory, or the last opened one.
+        let start_dir = self
+            .tree
+            .as_ref()
+            .map(|t| t.file_path.as_path())
+            .or_else(|| self.recent.first().map(|p| p.as_path()))
+            .and_then(Path::parent);
+        if let Some(dir) = start_dir {
+            dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.pick_file() {
             self.open_file(&path, ctx);
@@ -355,6 +365,41 @@ impl App {
                 if ui.button("📂 Open…").clicked() {
                     self.open_dialog(ctx);
                 }
+                let mut reopen: Option<PathBuf> = None;
+                let mut clear_recent = false;
+                ui.add_enabled_ui(!self.recent.is_empty(), |ui| {
+                    ui.menu_button("🕘 Recent", |ui| {
+                        for p in &self.recent {
+                            let name = p
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| p.display().to_string());
+                            let exists = p.exists();
+                            let resp = ui
+                                .add_enabled(exists, egui::Button::new(name))
+                                .on_hover_text(p.display().to_string())
+                                .on_disabled_hover_text(format!(
+                                    "File not found: {}",
+                                    p.display()
+                                ));
+                            if resp.clicked() {
+                                reopen = Some(p.clone());
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Clear list").clicked() {
+                            clear_recent = true;
+                        }
+                    })
+                    .response
+                    .on_hover_text("Reopen one of the last files");
+                });
+                if let Some(p) = reopen {
+                    self.open_file(&p, ctx);
+                }
+                if clear_recent {
+                    recent::clear(&mut self.recent);
+                }
                 ui.separator();
                 ui.label("🔍");
                 let resp = ui.add(
@@ -417,7 +462,7 @@ impl App {
             .show(ui, |ui| {
                 let Some(tree) = &self.tree else {
                     ui.add_space(20.0);
-                    ui.label("Open a NeXus file (📂 button above, or drag & drop).");
+                    ui.label("Open a NeXus file (📂 or 🕘 Recent above, or drag & drop).");
                     return;
                 };
                 ui.label(
