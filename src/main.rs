@@ -109,6 +109,11 @@ struct App {
     xy_cache: Option<XyCache>,
     /// Most-recently opened files, newest first (persisted across restarts).
     recent: Vec<PathBuf>,
+    /// "Open path" popup: visible, typed text, focus request, last error.
+    path_popup: bool,
+    path_input: String,
+    path_focus: bool,
+    path_error: Option<String>,
 }
 
 impl App {
@@ -133,22 +138,93 @@ impl App {
         }
     }
 
-    fn open_dialog(&mut self, ctx: &egui::Context) {
+    fn open_dialog(&mut self, ctx: &egui::Context, start: Option<&Path>) {
         let mut dialog = rfd::FileDialog::new()
             .add_filter("NeXus / HDF5", &["h5", "nxs", "hdf5", "nx5", "nxs.h5"])
             .add_filter("All files", &["*"]);
-        // Start in the current file's directory, or the last opened one.
-        let start_dir = self
-            .tree
-            .as_ref()
-            .map(|t| t.file_path.as_path())
-            .or_else(|| self.recent.first().map(|p| p.as_path()))
-            .and_then(Path::parent);
+        // Start where asked, else in the current file's directory, or the
+        // last opened one.
+        let start_dir = start.or_else(|| {
+            self.tree
+                .as_ref()
+                .map(|t| t.file_path.as_path())
+                .or_else(|| self.recent.first().map(|p| p.as_path()))
+                .and_then(Path::parent)
+        });
         if let Some(dir) = start_dir {
             dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.pick_file() {
             self.open_file(&path, ctx);
+        }
+    }
+
+    /// Open what is typed in the path popup: a file directly, a directory as
+    /// the starting point of the browse dialog.
+    fn open_typed_path(&mut self, ctx: &egui::Context) {
+        let mut typed = self.path_input.trim().to_owned();
+        if let Some(rest) = typed.strip_prefix("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                typed = format!("{home}/{rest}");
+            }
+        }
+        if typed.is_empty() {
+            return;
+        }
+        let path = PathBuf::from(&typed);
+        if path.is_file() {
+            self.path_popup = false;
+            self.path_error = None;
+            self.open_file(&path, ctx);
+        } else if path.is_dir() {
+            self.path_popup = false;
+            self.path_error = None;
+            self.open_dialog(ctx, Some(&path));
+        } else {
+            self.path_error = Some(format!("Not found: {}", path.display()));
+        }
+    }
+
+    /// Modal with a text field to type/paste a path instead of browsing.
+    fn show_path_popup(&mut self, ctx: &egui::Context) {
+        if !self.path_popup {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("open_path")).show(ctx, |ui| {
+            ui.set_width(620.0);
+            ui.heading("Open path");
+            ui.label("File path opens it directly; directory path starts the browser there.");
+            ui.add_space(6.0);
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.path_input)
+                    .hint_text("/SNS/VENUS/IPTS-xxxxx/nexus/…")
+                    .desired_width(f32::INFINITY),
+            );
+            if self.path_focus {
+                resp.request_focus();
+                self.path_focus = false;
+            }
+            if resp.changed() {
+                self.path_error = None;
+            }
+            if let Some(err) = &self.path_error {
+                ui.colored_label(ui.visuals().error_fg_color, err);
+            }
+            ui.add_space(6.0);
+            let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.horizontal(|ui| {
+                if ui.button("Open").clicked() || entered {
+                    self.open_typed_path(ctx);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.path_popup = false;
+                    self.path_error = None;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.path_popup = false;
+            self.path_error = None;
         }
     }
 
@@ -351,6 +427,7 @@ impl eframe::App for App {
         }
 
         self.top_bar(ui, &ctx);
+        self.show_path_popup(&ctx);
         self.update_filter();
         self.left_tree(ui);
         self.right_panel(ui);
@@ -363,7 +440,28 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("📂 Open…").clicked() {
-                    self.open_dialog(ctx);
+                    self.open_dialog(ctx, None);
+                }
+                if ui
+                    .button("⌨ Path…")
+                    .on_hover_text("Type or paste a file / directory path")
+                    .clicked()
+                {
+                    // Pre-fill with the current file's directory.
+                    if self.path_input.is_empty() {
+                        if let Some(dir) = self
+                            .tree
+                            .as_ref()
+                            .map(|t| t.file_path.as_path())
+                            .or_else(|| self.recent.first().map(|p| p.as_path()))
+                            .and_then(Path::parent)
+                        {
+                            self.path_input = dir.display().to_string();
+                        }
+                    }
+                    self.path_popup = true;
+                    self.path_focus = true;
+                    self.path_error = None;
                 }
                 let mut reopen: Option<PathBuf> = None;
                 let mut clear_recent = false;

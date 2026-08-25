@@ -10,4 +10,6 @@ egui = "0.35"
 egui_plot = "0.36"
 hdf5-metno = "0.14.0"
 ndarray = "0.17.2"
-rfd = "0.17"
+# gtk3 backend (not the default xdg-portal one): the portal ignores
+# set_directory, so "start browsing here" would not work.
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
