@@ -12,7 +12,8 @@ to matching PVs.
 
 The script rebuilds automatically when sources changed. Without a file
 argument a file-open dialog appears; you can also drag & drop a file onto the
-window or use the **📂 Open…** button.
+window or use the **📂 Open…** button. Passing several files (or dropping
+several at once) opens them all, ready to compare.
 
 ## Features
 
@@ -34,6 +35,21 @@ window or use the **📂 Open…** button.
   - **both as y** — the two curves overlaid over time, with a legend and an
     optional *normalize [0–1]* checkbox for PVs of very different magnitudes.
   Ctrl+click the `[2]` entry again (or the ✖ button) to leave compare mode.
+  The two PVs may live in two different files.
+- **Compare PVs across files**: open more files with **➕ Add…** (or
+  Ctrl+click in the 🕘 Recent menu, or Ctrl+drop, or drop several files at
+  once — the 📂/➕ dialogs also allow Ctrl/Shift multi-select). Each file
+  gets its own collapsible section in the tree (✖ closes it, "✖ all" in the
+  top bar closes everything). Clicking a PV then shows it for *every* open
+  file: a scrollable table with the value per file (with a Δ column for
+  scalars) and, for logged PVs, all the curves overlaid in one plot with an
+  optional *normalize [0–1]* checkbox. A scalar PV across 3+ files is also
+  plotted as value vs run number. The search bar filters all open files at
+  once.
+- **Open a whole run range** with **🔢 Runs…**: give a directory and a run
+  list like `26871-26970, 27012` and every NeXus file there whose name ends
+  in one of those run numbers is opened (works for 100+ files: they load in
+  the background with a progress spinner and a cancel button).
 - **Search bar** (top): type to narrow the tree to matching PVs only; the
   `Aa` toggle switches case-sensitive matching, `✖` clears. Matching names
   are highlighted and branches auto-expand.

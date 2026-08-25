@@ -37,6 +37,12 @@ impl Tree {
             .copied()
             .find(|&c| self.nodes[c].name == name)
     }
+
+    /// Node with exactly this HDF5 path, if the file has one (used to find
+    /// the same PV in other open files).
+    pub fn node_by_path(&self, path: &str) -> Option<usize> {
+        self.nodes.iter().position(|n| n.path == path)
+    }
 }
 
 pub fn load(path: &Path) -> Result<Tree> {
