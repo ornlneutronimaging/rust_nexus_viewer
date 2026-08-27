@@ -149,6 +149,19 @@ struct App {
     range_key: Option<(String, String)>,
     range_matches: Vec<PathBuf>,
     range_error: Option<String>,
+    /// Extra info about the matches ("from 3 IPTS; 2 runs not found").
+    range_note: Option<String>,
+    /// Run → NeXus file index over every IPTS of the instrument, used when
+    /// the runs popup is asked to locate runs without a directory.
+    run_index: Option<RunIndex>,
+    /// Pending background scan building that index.
+    index_rx: Option<std::sync::mpsc::Receiver<RunIndex>>,
+}
+
+/// Every run number found under `root`/IPTS-*/nexus, mapped to its file.
+struct RunIndex {
+    root: PathBuf,
+    by_run: std::collections::BTreeMap<u64, PathBuf>,
 }
 
 impl App {
@@ -426,13 +439,16 @@ impl App {
             ui.set_width(620.0);
             ui.heading("Open runs");
             ui.label(
-                "Opens every NeXus file in the directory whose run number is in the list.",
+                "Opens the NeXus file of every run in the list. With no directory, \
+                 the runs are located automatically across all IPTS experiments.",
             );
             ui.add_space(6.0);
-            ui.label("Directory:");
+            let root_hint =
+                format!("empty = search {}/IPTS-*/nexus", self.instrument_root().display());
+            ui.label("Directory (optional — empty searches every IPTS):");
             ui.add(
                 egui::TextEdit::singleline(&mut self.range_dir)
-                    .hint_text("/SNS/VENUS/IPTS-xxxxx/nexus")
+                    .hint_text(root_hint)
                     .desired_width(f32::INFINITY),
             );
             ui.add_space(4.0);
@@ -447,27 +463,54 @@ impl App {
                 self.range_focus = false;
             }
             self.update_range_matches();
+            let scanning = self.index_rx.is_some()
+                && self.range_dir.trim().is_empty()
+                && !self.range_input.trim().is_empty();
             let file_name = |p: &PathBuf| {
                 p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
             };
-            if let Some(err) = &self.range_error {
+            if scanning {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!(
+                        "scanning {}/IPTS-*/nexus …",
+                        self.instrument_root().display()
+                    ));
+                });
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            } else if let Some(err) = &self.range_error {
                 ui.colored_label(ui.visuals().error_fg_color, err);
             } else {
-                match self.range_matches.len() {
-                    0 => {
-                        ui.label(RichText::new("no matching file").weak());
+                ui.horizontal(|ui| {
+                    match self.range_matches.len() {
+                        0 => {
+                            ui.label(RichText::new("no matching file").weak());
+                        }
+                        1 => {
+                            ui.label(format!("1 file: {}", file_name(&self.range_matches[0])));
+                        }
+                        n => {
+                            ui.label(format!(
+                                "{n} files: {} … {}",
+                                file_name(&self.range_matches[0]),
+                                file_name(&self.range_matches[n - 1])
+                            ));
+                        }
                     }
-                    1 => {
-                        ui.label(format!("1 file: {}", file_name(&self.range_matches[0])));
+                    if let Some(note) = &self.range_note {
+                        ui.label(RichText::new(note).weak());
                     }
-                    n => {
-                        ui.label(format!(
-                            "{n} files: {} … {}",
-                            file_name(&self.range_matches[0]),
-                            file_name(&self.range_matches[n - 1])
-                        ));
+                    if self.run_index.is_some()
+                        && self.range_dir.trim().is_empty()
+                        && ui
+                            .small_button("⟳")
+                            .on_hover_text("Rescan the IPTS directories (picks up new runs)")
+                            .clicked()
+                    {
+                        self.run_index = None;
+                        self.range_key = None;
                     }
-                }
+                });
             }
             ui.add_space(6.0);
             let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -496,8 +539,14 @@ impl App {
         }
     }
 
-    /// Rescan the directory when the run popup inputs changed.
+    /// Recompute the run-popup match list when its inputs changed.
     fn update_range_matches(&mut self) {
+        // Collect a finished IPTS scan and recompute with the fresh index.
+        if let Some(Ok(idx)) = self.index_rx.as_ref().map(|rx| rx.try_recv()) {
+            self.run_index = Some(idx);
+            self.index_rx = None;
+            self.range_key = None;
+        }
         let key = (self.range_dir.clone(), self.range_input.clone());
         if self.range_key.as_ref() == Some(&key) {
             return;
@@ -505,6 +554,7 @@ impl App {
         self.range_key = Some(key);
         self.range_matches.clear();
         self.range_error = None;
+        self.range_note = None;
         if self.range_input.trim().is_empty() {
             return;
         }
@@ -513,6 +563,28 @@ impl App {
             return;
         };
         let mut dir = self.range_dir.trim().to_owned();
+        if dir.is_empty() {
+            // No directory: locate the runs across every IPTS experiment.
+            let root = self.instrument_root();
+            match &self.run_index {
+                Some(idx) if idx.root == root => {
+                    let mut hits: Vec<(u64, PathBuf)> = Vec::new();
+                    for &(lo, hi) in &ranges {
+                        hits.extend(idx.by_run.range(lo..=hi).map(|(&r, p)| (r, p.clone())));
+                    }
+                    hits.sort();
+                    hits.dedup();
+                    self.range_matches = hits.into_iter().map(|(_, p)| p).collect();
+                    self.range_note = Some(auto_match_note(&self.range_matches, &ranges));
+                }
+                _ => {
+                    self.start_index_scan(root);
+                    // Recompute each frame until the scan lands.
+                    self.range_key = None;
+                }
+            }
+            return;
+        }
         if let Some(rest) = dir.strip_prefix("~/") {
             if let Ok(home) = std::env::var("HOME") {
                 dir = format!("{home}/{rest}");
@@ -524,6 +596,39 @@ impl App {
             return;
         }
         self.range_matches = find_run_files(&dir, &ranges);
+    }
+
+    /// Instrument root (e.g. /SNS/VENUS) whose IPTS-* directories the run
+    /// search scans: taken from the current or recent file's path, VENUS
+    /// otherwise.
+    fn instrument_root(&self) -> PathBuf {
+        let from = |p: &Path| {
+            p.ancestors()
+                .find(|a| {
+                    a.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("IPTS-"))
+                })
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        };
+        self.files
+            .first()
+            .and_then(|f| from(&f.tree.file_path))
+            .or_else(|| self.recent.iter().find_map(|p| from(p)))
+            .unwrap_or_else(|| PathBuf::from("/SNS/VENUS"))
+    }
+
+    /// Scan `root`/IPTS-*/nexus on a background thread (tens of thousands of
+    /// directory entries on a network filesystem — too slow for the UI thread).
+    fn start_index_scan(&mut self, root: PathBuf) {
+        if self.index_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.index_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(build_run_index(&root));
+        });
     }
 
     /// Recompute the per-file search-match arrays if the query or the set of
@@ -780,17 +885,11 @@ impl App {
                 if ui
                     .button("🔢 Runs…")
                     .on_hover_text(
-                        "Open a whole range of run numbers from a directory\n\
-                         (e.g. 26871-26970)",
+                        "Open runs by number (e.g. 26871-26970) — their NeXus\n\
+                         files are located automatically across all IPTS",
                     )
                     .clicked()
                 {
-                    // Pre-fill with the current file's directory.
-                    if self.range_dir.is_empty() {
-                        if let Some(dir) = self.default_dir() {
-                            self.range_dir = dir.display().to_string();
-                        }
-                    }
                     self.range_popup = true;
                     self.range_focus = true;
                 }
@@ -1283,6 +1382,70 @@ fn find_run_files(dir: &Path, ranges: &[(u64, u64)]) -> Vec<PathBuf> {
     hits.into_iter().map(|(_, p)| p).collect()
 }
 
+/// Index every run found under `root`/IPTS-*/nexus. A run lives in exactly
+/// one IPTS, so a flat run → file map is enough to locate it.
+fn build_run_index(root: &Path) -> RunIndex {
+    let mut by_run = std::collections::BTreeMap::new();
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for entry in rd.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("IPTS-") {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(entry.path().join("nexus")) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let name = f.file_name().to_string_lossy().into_owned();
+                let Some(stem) = NEXUS_EXTS.iter().find_map(|e| name.strip_suffix(e)) else {
+                    continue;
+                };
+                if let Some(run) = trailing_number(stem) {
+                    by_run.insert(run, f.path());
+                }
+            }
+        }
+    }
+    RunIndex { root: root.to_path_buf(), by_run }
+}
+
+/// "from 3 IPTS" plus how many requested runs have no file, for the
+/// located-anywhere mode of the runs popup.
+fn auto_match_note(matches: &[PathBuf], ranges: &[(u64, u64)]) -> String {
+    let ipts: std::collections::HashSet<&Path> = matches
+        .iter()
+        .filter_map(|p| p.parent().and_then(Path::parent))
+        .collect();
+    let requested = merged_run_count(ranges);
+    let missing = requested.saturating_sub(matches.len() as u64);
+    let mut note = format!("(from {} IPTS", ipts.len());
+    if missing > 0 {
+        note += &format!("; {missing} of the {requested} runs not found");
+    }
+    note + ")"
+}
+
+/// Number of distinct runs the (possibly overlapping) ranges ask for.
+fn merged_run_count(ranges: &[(u64, u64)]) -> u64 {
+    let mut sorted = ranges.to_vec();
+    sorted.sort();
+    let mut total = 0;
+    let mut cur: Option<(u64, u64)> = None;
+    for &(lo, hi) in &sorted {
+        match cur {
+            Some((clo, chi)) if lo <= chi => cur = Some((clo, chi.max(hi))),
+            Some((clo, chi)) => {
+                total += chi - clo + 1;
+                cur = Some((lo, hi));
+            }
+            None => cur = Some((lo, hi)),
+        }
+    }
+    if let Some((clo, chi)) = cur {
+        total += chi - clo + 1;
+    }
+    total
+}
+
 /// The number a name ends with ("VENUS_26871" → 26871).
 fn trailing_number(s: &str) -> Option<u64> {
     let b = s.as_bytes();
@@ -1317,6 +1480,24 @@ mod run_range_tests {
         assert_eq!(trailing_number("run42"), Some(42));
         assert_eq!(trailing_number("VENUS_"), None);
         assert_eq!(trailing_number(""), None);
+    }
+
+    #[test]
+    fn merged_run_counts() {
+        assert_eq!(merged_run_count(&[(10, 20)]), 11);
+        // Overlapping and duplicate ranges count each run once.
+        assert_eq!(merged_run_count(&[(10, 20), (15, 25), (15, 25)]), 16);
+        assert_eq!(merged_run_count(&[(30, 30), (10, 20)]), 12);
+    }
+
+    #[test]
+    fn index_locates_run_without_ipts() {
+        // Run 26871 lives in IPTS-38715; the index must find it from the
+        // instrument root alone.
+        let idx = build_run_index(Path::new("/SNS/VENUS"));
+        assert!(idx.by_run.len() > 1000);
+        let p = idx.by_run.get(&26871).expect("run 26871 in the index");
+        assert!(p.ends_with("IPTS-38715/nexus/VENUS_26871.nxs.h5"), "{}", p.display());
     }
 
     #[test]

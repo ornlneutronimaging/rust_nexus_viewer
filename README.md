@@ -46,10 +46,13 @@ several at once) opens them all, ready to compare.
   optional *normalize [0–1]* checkbox. A scalar PV across 3+ files is also
   plotted as value vs run number. The search bar filters all open files at
   once.
-- **Open a whole run range** with **🔢 Runs…**: give a directory and a run
-  list like `26871-26970, 27012` and every NeXus file there whose name ends
-  in one of those run numbers is opened (works for 100+ files: they load in
-  the background with a progress spinner and a cancel button).
+- **Open runs by number** with **🔢 Runs…**: type a run list like
+  `26871-26970, 27012` and the matching NeXus files are opened. With no
+  directory given, each run is located automatically by scanning every
+  `/SNS/VENUS/IPTS-*/nexus` directory (the runs of one list may come from
+  different IPTS experiments); give a directory to restrict the search to
+  it. Works for 100+ files: they load in the background with a progress
+  spinner and a cancel button.
 - **Search bar** (top): type to narrow the tree to matching PVs only; the
   `Aa` toggle switches case-sensitive matching, `✖` clears. Matching names
   are highlighted and branches auto-expand.
