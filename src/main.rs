@@ -1177,7 +1177,7 @@ impl App {
                 });
                 ui.separator();
             }
-            let Some(loaded) = &self.loaded else {
+            if self.loaded.is_none() {
                 ui.add_space(20.0);
                 ui.label(
                     RichText::new(
@@ -1188,150 +1188,20 @@ impl App {
                     .weak(),
                 );
                 return;
-            };
-            let many = self.files.len() > 1;
-            let tree = &self.files[loaded.file].tree;
-            let node = &tree.nodes[loaded.node];
-
-            ui.horizontal(|ui| {
-                if self.loaded2.is_some() {
-                    ui.label(RichText::new("[1]").strong());
-                    if many {
-                        ui.label(RichText::new(self.file_label(loaded.file)).strong());
-                    }
-                }
-                ui.label(RichText::new(&node.path).monospace().strong());
-                if ui.small_button("📋").on_hover_text("Copy path").clicked() {
-                    ui.ctx().copy_text(node.path.clone());
-                }
-            });
-            if let Some(l2) = &self.loaded2 {
-                let node2 = &self.files[l2.file].tree.nodes[l2.node];
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("[2]").strong());
-                    if many {
-                        ui.label(RichText::new(self.file_label(l2.file)).strong());
-                    }
-                    ui.label(RichText::new(&node2.path).monospace().strong());
-                    if ui.small_button("📋").on_hover_text("Copy path").clicked() {
-                        ui.ctx().copy_text(node2.path.clone());
-                    }
-                    if ui.small_button("✖").on_hover_text("Remove second selection").clicked() {
-                        clear_second = true;
-                    }
+            }
+            // The plots adapt to the window, but the header rows, the
+            // attribute list and the plots' minimum heights can outgrow a
+            // short window (small displays, the large-text mode). The panel
+            // height is measured before entering the scroll area — inside it
+            // the available height is unbounded — and the minimum plot
+            // heights are what make the scroll bar appear.
+            let panel_h = ui.available_height();
+            egui::ScrollArea::vertical()
+                .id_salt("dataset_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.dataset_content(ui, panel_h, &mut mode, &mut swap, &mut norm, &mut clear_second);
                 });
-            }
-
-            // Compare view when a second plottable PV is selected.
-            if let Some(l2) = &self.loaded2 {
-                if loaded.plottable() && l2.plottable() {
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Plot:");
-                        ui.selectable_value(&mut mode, CompareMode::Xy, "1 vs 2");
-                        ui.selectable_value(&mut mode, CompareMode::Overlay, "both as y");
-                        match mode {
-                            CompareMode::Xy => {
-                                if ui.button("swap axes").clicked() {
-                                    swap = !swap;
-                                }
-                            }
-                            CompareMode::Overlay => {
-                                ui.checkbox(&mut norm, "normalize [0–1]");
-                            }
-                        }
-                    });
-                    if let Some(s) = &loaded.stats {
-                        stats_line(ui, "[1] ", s);
-                    }
-                    if let Some(s) = &l2.stats {
-                        stats_line(ui, "[2] ", s);
-                    }
-                    ui.add_space(4.0);
-                    match mode {
-                        CompareMode::Xy => {
-                            let key = (loaded.sel(), l2.sel(), swap);
-                            draw_xy(ui, self.xy_cache.as_ref(), key);
-                        }
-                        CompareMode::Overlay => draw_overlay(ui, loaded, l2, norm),
-                    }
-                    return;
-                }
-                let color = ui.visuals().warn_fg_color;
-                ui.colored_label(
-                    color,
-                    "The 2nd selection has no plottable 1-D array — showing the 1st only.",
-                );
-            }
-
-            // Cross-file view: the selected PV in every open file.
-            if many && self.loaded2.is_none() {
-                let labels: Vec<String> =
-                    (0..self.files.len()).map(|f| self.file_label(f)).collect();
-                draw_multi(ui, &self.multi, &labels, &mut norm);
-                return;
-            }
-
-            ui.label(
-                RichText::new(format!("dtype: {}   shape: {:?}", node.dtype, node.shape)).weak(),
-            );
-
-            if !loaded.attrs.is_empty() {
-                egui::CollapsingHeader::new(format!("Attributes ({})", loaded.attrs.len()))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        egui::Grid::new("attrs").striped(true).show(ui, |ui| {
-                            for (k, v) in &loaded.attrs {
-                                ui.label(RichText::new(k).monospace());
-                                ui.label(RichText::new(v).monospace());
-                                ui.end_row();
-                            }
-                        });
-                    });
-            }
-            ui.separator();
-
-            match &loaded.value {
-                Value::Empty => {
-                    ui.label(RichText::new("(empty dataset)").weak());
-                }
-                Value::Unsupported(msg) => {
-                    let color = ui.visuals().error_fg_color;
-                    ui.colored_label(color, msg);
-                }
-                Value::Strings(items) => show_strings(ui, items),
-                Value::Numeric { data, shape } => {
-                    if data.len() == 1 {
-                        let units = loaded
-                            .attrs
-                            .iter()
-                            .find(|(k, _)| k == "units")
-                            .map(|(_, v)| format!(" {v}"))
-                            .unwrap_or_default();
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(format!("{}{units}", format_num(data[0])))
-                                .monospace()
-                                .size(26.0),
-                        );
-                    } else if !loaded.points.is_empty() {
-                        show_plot(ui, loaded);
-                    } else {
-                        ui.label(format!(
-                            "{}-D array {:?} — plotting supports 1-D data. First values:",
-                            shape.len(),
-                            shape
-                        ));
-                        ui.label(
-                            RichText::new(h5io::format_value_short(&loaded.value, 100))
-                                .monospace(),
-                        );
-                        if let Some(s) = &loaded.stats {
-                            stats_line(ui, "", s);
-                        }
-                    }
-                }
-            }
         });
         self.compare_mode = mode;
         self.swap_xy = swap;
@@ -1343,6 +1213,164 @@ impl App {
         }
         if dismiss_error {
             self.error = None;
+        }
+    }
+
+    /// The dataset view inside the central panel's scroll area. The flag
+    /// references land back on `self` after the panel closes (the borrow of
+    /// the loaded dataset keeps `self` shared here).
+    fn dataset_content(
+        &self,
+        ui: &mut egui::Ui,
+        panel_h: f32,
+        mode: &mut CompareMode,
+        swap: &mut bool,
+        norm: &mut bool,
+        clear_second: &mut bool,
+    ) {
+        let Some(loaded) = &self.loaded else { return };
+        let many = self.files.len() > 1;
+        let tree = &self.files[loaded.file].tree;
+        let node = &tree.nodes[loaded.node];
+
+        ui.horizontal(|ui| {
+            if self.loaded2.is_some() {
+                ui.label(RichText::new("[1]").strong());
+                if many {
+                    ui.label(RichText::new(self.file_label(loaded.file)).strong());
+                }
+            }
+            ui.label(RichText::new(&node.path).monospace().strong());
+            if ui.small_button("📋").on_hover_text("Copy path").clicked() {
+                ui.ctx().copy_text(node.path.clone());
+            }
+        });
+        if let Some(l2) = &self.loaded2 {
+            let node2 = &self.files[l2.file].tree.nodes[l2.node];
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("[2]").strong());
+                if many {
+                    ui.label(RichText::new(self.file_label(l2.file)).strong());
+                }
+                ui.label(RichText::new(&node2.path).monospace().strong());
+                if ui.small_button("📋").on_hover_text("Copy path").clicked() {
+                    ui.ctx().copy_text(node2.path.clone());
+                }
+                if ui.small_button("✖").on_hover_text("Remove second selection").clicked() {
+                    *clear_second = true;
+                }
+            });
+        }
+
+        // Compare view when a second plottable PV is selected.
+        if let Some(l2) = &self.loaded2 {
+            if loaded.plottable() && l2.plottable() {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Plot:");
+                    ui.selectable_value(mode, CompareMode::Xy, "1 vs 2");
+                    ui.selectable_value(mode, CompareMode::Overlay, "both as y");
+                    match *mode {
+                        CompareMode::Xy => {
+                            if ui.button("swap axes").clicked() {
+                                *swap = !*swap;
+                            }
+                        }
+                        CompareMode::Overlay => {
+                            ui.checkbox(norm, "normalize [0–1]");
+                        }
+                    }
+                });
+                if let Some(s) = &loaded.stats {
+                    stats_line(ui, "[1] ", s);
+                }
+                if let Some(s) = &l2.stats {
+                    stats_line(ui, "[2] ", s);
+                }
+                ui.add_space(4.0);
+                match *mode {
+                    CompareMode::Xy => {
+                        let key = (loaded.sel(), l2.sel(), *swap);
+                        draw_xy(ui, self.xy_cache.as_ref(), key, panel_h);
+                    }
+                    CompareMode::Overlay => draw_overlay(ui, loaded, l2, *norm, panel_h),
+                }
+                return;
+            }
+            let color = ui.visuals().warn_fg_color;
+            ui.colored_label(
+                color,
+                "The 2nd selection has no plottable 1-D array — showing the 1st only.",
+            );
+        }
+
+        // Cross-file view: the selected PV in every open file.
+        if many && self.loaded2.is_none() {
+            let labels: Vec<String> =
+                (0..self.files.len()).map(|f| self.file_label(f)).collect();
+            draw_multi(ui, &self.multi, &labels, norm, panel_h);
+            return;
+        }
+
+        ui.label(
+            RichText::new(format!("dtype: {}   shape: {:?}", node.dtype, node.shape)).weak(),
+        );
+
+        if !loaded.attrs.is_empty() {
+            egui::CollapsingHeader::new(format!("Attributes ({})", loaded.attrs.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::Grid::new("attrs").striped(true).show(ui, |ui| {
+                        for (k, v) in &loaded.attrs {
+                            ui.label(RichText::new(k).monospace());
+                            ui.label(RichText::new(v).monospace());
+                            ui.end_row();
+                        }
+                    });
+                });
+        }
+        ui.separator();
+
+        match &loaded.value {
+            Value::Empty => {
+                ui.label(RichText::new("(empty dataset)").weak());
+            }
+            Value::Unsupported(msg) => {
+                let color = ui.visuals().error_fg_color;
+                ui.colored_label(color, msg);
+            }
+            Value::Strings(items) => show_strings(ui, items, panel_h),
+            Value::Numeric { data, shape } => {
+                if data.len() == 1 {
+                    let units = loaded
+                        .attrs
+                        .iter()
+                        .find(|(k, _)| k == "units")
+                        .map(|(_, v)| format!(" {v}"))
+                        .unwrap_or_default();
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("{}{units}", format_num(data[0])))
+                            .monospace()
+                            .size(26.0),
+                    );
+                } else if !loaded.points.is_empty() {
+                    show_plot(ui, loaded, panel_h);
+                } else {
+                    ui.label(format!(
+                        "{}-D array {:?} — plotting supports 1-D data. First values:",
+                        shape.len(),
+                        shape
+                    ));
+                    ui.label(
+                        RichText::new(h5io::format_value_short(&loaded.value, 100))
+                            .monospace(),
+                    );
+                    if let Some(s) = &loaded.stats {
+                        stats_line(ui, "", s);
+                    }
+                }
+            }
         }
     }
 }
@@ -1531,6 +1559,7 @@ fn draw_multi(
     multi: &[Option<Loaded>],
     labels: &[String],
     normalize: &mut bool,
+    panel_h: f32,
 ) {
     let scalar = |l: &Loaded| match &l.value {
         Value::Numeric { data, .. } if data.len() == 1 => Some(data[0]),
@@ -1541,7 +1570,9 @@ fn draw_multi(
     ui.separator();
     // With ~100 open files the table alone would fill the screen — scroll it
     // and keep the plot below visible.
-    let table_height = (ui.available_height() * 0.45)
+    let remaining = (panel_h - ui.min_rect().height() - ui.spacing().item_spacing.y).max(0.0);
+    let table_height = (remaining * 0.45)
+        .max(100.0)
         .min(22.0 * multi.len() as f32 + 8.0);
     egui::ScrollArea::vertical()
         .id_salt("multi_table")
@@ -1610,7 +1641,8 @@ fn draw_multi(
         let mut plot = Plot::new("multi_plot")
             .x_axis_label(x_label)
             .y_axis_label(y_label)
-            .allow_boxed_zoom(true);
+            .allow_boxed_zoom(true)
+            .height(plot_height(ui, panel_h));
         if plottable.len() <= 20 {
             plot = plot.legend(Legend::default());
         }
@@ -1658,6 +1690,7 @@ fn draw_multi(
             .x_axis_label(x_label)
             .y_axis_label(y_label.clone())
             .allow_boxed_zoom(true)
+            .height(plot_height(ui, panel_h))
             .show(ui, |plot_ui| {
                 plot_ui.line(Line::new(y_label.clone(), PlotPoints::from(pts.clone())));
                 plot_ui.points(Points::new(y_label, PlotPoints::from(pts)).radius(3.0));
@@ -1697,13 +1730,15 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn show_strings(ui: &mut egui::Ui, items: &[String]) {
+fn show_strings(ui: &mut egui::Ui, items: &[String], panel_h: f32) {
     ui.add_space(8.0);
     if items.len() == 1 {
         ui.label(RichText::new(&items[0]).monospace().size(20.0));
     } else {
         ui.label(RichText::new(format!("{} strings:", items.len())).weak());
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Nested inside the panel's scroll area, so it needs its own cap.
+        let list_h = plot_height(ui, panel_h);
+        egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             for (i, s) in items.iter().enumerate().take(2000) {
                 ui.label(RichText::new(format!("[{i}] {s}")).monospace());
             }
@@ -1735,7 +1770,7 @@ fn series_label(l: &Loaded) -> String {
     }
 }
 
-fn show_plot(ui: &mut egui::Ui, loaded: &Loaded) {
+fn show_plot(ui: &mut egui::Ui, loaded: &Loaded, panel_h: f32) {
     if let Some(s) = &loaded.stats {
         stats_line(ui, "", s);
     }
@@ -1746,6 +1781,7 @@ fn show_plot(ui: &mut egui::Ui, loaded: &Loaded) {
         .x_axis_label(loaded.x_label.clone())
         .y_axis_label(y_label)
         .allow_boxed_zoom(true)
+        .height(plot_height(ui, panel_h))
         .show(ui, |plot_ui| {
             plot_ui.line(line);
         });
@@ -1821,7 +1857,14 @@ fn stride_cap(points: Vec<[f64; 2]>, max: usize) -> Vec<[f64; 2]> {
     points.into_iter().step_by(step).collect()
 }
 
-fn draw_xy(ui: &mut egui::Ui, cache: Option<&XyCache>, key: (Sel, Sel, bool)) {
+/// Height for a plot filling the rest of the panel: what the panel has left
+/// under the content drawn so far, floored so a short window scrolls instead
+/// of squeezing the plot away.
+fn plot_height(ui: &egui::Ui, panel_h: f32) -> f32 {
+    (panel_h - ui.min_rect().height() - ui.spacing().item_spacing.y).max(160.0)
+}
+
+fn draw_xy(ui: &mut egui::Ui, cache: Option<&XyCache>, key: (Sel, Sel, bool), panel_h: f32) {
     let Some(c) = cache.filter(|c| c.key == key) else {
         // The cache is rebuilt at the start of the next frame.
         ui.spinner();
@@ -1844,12 +1887,13 @@ fn draw_xy(ui: &mut egui::Ui, cache: Option<&XyCache>, key: (Sel, Sel, bool)) {
         .x_axis_label(c.x_label.clone())
         .y_axis_label(c.y_label.clone())
         .allow_boxed_zoom(true)
+        .height(plot_height(ui, panel_h))
         .show(ui, |plot_ui| {
             plot_ui.points(pts);
         });
 }
 
-fn draw_overlay(ui: &mut egui::Ui, a: &Loaded, b: &Loaded, normalize: bool) {
+fn draw_overlay(ui: &mut egui::Ui, a: &Loaded, b: &Loaded, normalize: bool, panel_h: f32) {
     let x_label = if a.x_label == b.x_label {
         a.x_label.clone()
     } else {
@@ -1877,6 +1921,7 @@ fn draw_overlay(ui: &mut egui::Ui, a: &Loaded, b: &Loaded, normalize: bool) {
         .x_axis_label(x_label)
         .y_axis_label(y_label)
         .allow_boxed_zoom(true)
+        .height(plot_height(ui, panel_h))
         .show(ui, |plot_ui| {
             plot_ui.line(la);
             plot_ui.line(lb);
