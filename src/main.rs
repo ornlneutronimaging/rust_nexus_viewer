@@ -5,6 +5,7 @@
 mod h5io;
 mod recent;
 mod theme;
+mod zoom;
 
 use eframe::egui;
 use egui::{Color32, RichText};
@@ -28,6 +29,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             // Saved light/dark preference, shared by all the VENUS rust tools.
             cc.egui_ctx.set_theme(theme::load());
+            cc.egui_ctx.set_zoom_factor(zoom::load());
             let mut app = App::default();
             app.recent = recent::load();
             app.enqueue_opens(arg_paths, false);
@@ -1000,6 +1002,7 @@ impl App {
                 let mut close_all = false;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     theme::toggle_button(ui);
+                    zoom::toggle_button(ui);
                     match self.files.len() {
                         0 => {}
                         1 => {
