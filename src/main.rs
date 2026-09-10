@@ -32,6 +32,7 @@ fn main() -> eframe::Result {
             cc.egui_ctx.set_zoom_factor(zoom::load());
             let mut app = App::default();
             app.recent = recent::load();
+            app.recent_pvs = recent::load_pvs();
             app.enqueue_opens(arg_paths, false);
             Ok(Box::new(app))
         }),
@@ -121,9 +122,10 @@ struct App {
     total_matches: usize,
     selected: Option<Sel>,
     loaded: Option<Loaded>,
-    /// Second selection (Ctrl+click) for compare plots.
-    second: Option<Sel>,
-    loaded2: Option<Loaded>,
+    /// Further selections (Ctrl+click, or the recent-PV checkboxes) for
+    /// compare plots: one pairs with the main PV as x-y or overlays it,
+    /// several all overlay it.
+    others: Vec<Loaded>,
     /// The selected PV loaded from every open file (index-aligned with
     /// `files`; None where the file has no dataset at that path).
     multi: Vec<Option<Loaded>>,
@@ -133,6 +135,9 @@ struct App {
     xy_cache: Option<XyCache>,
     /// Most-recently opened files, newest first (persisted across restarts).
     recent: Vec<PathBuf>,
+    /// Dataset paths of the most-recently plotted PVs, newest first
+    /// (persisted across restarts).
+    recent_pvs: Vec<String>,
     /// "Open path" popup: visible, typed text, focus request, last error.
     path_popup: bool,
     path_input: String,
@@ -158,6 +163,9 @@ struct App {
     run_index: Option<RunIndex>,
     /// Pending background scan building that index.
     index_rx: Option<std::sync::mpsc::Receiver<RunIndex>>,
+    /// Width each toolbar group (files, search, status) took last frame;
+    /// decides how many rows the toolbar needs this frame.
+    top_widths: [f32; 3],
 }
 
 /// Every run number found under `root`/IPTS-*/nexus, mapped to its file.
@@ -189,8 +197,7 @@ impl App {
                     self.files.clear();
                     self.selected = None;
                     self.loaded = None;
-                    self.second = None;
-                    self.loaded2 = None;
+                    self.others.clear();
                     self.multi.clear();
                 }
                 self.files.push(OpenFile {
@@ -224,8 +231,7 @@ impl App {
             self.files.clear();
             self.selected = None;
             self.loaded = None;
-            self.second = None;
-            self.loaded2 = None;
+            self.others.clear();
             self.multi.clear();
             self.xy_cache = None;
             self.generation += 1;
@@ -269,8 +275,7 @@ impl App {
         self.pending_total = 0;
         self.selected = None;
         self.loaded = None;
-        self.second = None;
-        self.loaded2 = None;
+        self.others.clear();
         self.multi.clear();
         self.xy_cache = None;
         self.generation += 1;
@@ -307,7 +312,12 @@ impl App {
             }
         }
         fix(&mut self.selected, &mut self.loaded, f);
-        fix(&mut self.second, &mut self.loaded2, f);
+        self.others.retain(|l| l.file != f);
+        for l in &mut self.others {
+            if l.file > f {
+                l.file -= 1;
+            }
+        }
         self.rebuild_multi();
         self.update_title(ctx);
     }
@@ -684,17 +694,83 @@ impl App {
         self.xy_cache = None;
         self.loaded = Some(load_node(&self.files[file].tree, file, node));
         self.rebuild_multi();
+        // Groups are browsed for their attributes, not remembered as PVs.
+        if !self.files[file].tree.nodes[node].is_group {
+            self.remember_pv(file, node);
+        }
     }
 
-    /// Ctrl+click: set (or toggle off) the second PV of a compare plot.
-    fn select_second(&mut self, file: usize, node: usize) {
+    /// Ctrl+click: add a PV to (or remove it from) the compare plot.
+    fn toggle_other(&mut self, file: usize, node: usize) {
         self.xy_cache = None;
-        if self.second == Some((file, node)) {
-            self.second = None;
-            self.loaded2 = None;
-        } else {
-            self.second = Some((file, node));
-            self.loaded2 = Some(load_node(&self.files[file].tree, file, node));
+        if let Some(i) = self.others.iter().position(|l| l.sel() == (file, node)) {
+            self.others.remove(i);
+        } else if self.selected != Some((file, node)) {
+            self.others.push(load_node(&self.files[file].tree, file, node));
+            self.remember_pv(file, node);
+        }
+    }
+
+    /// Drop the `i`-th extra selection of the compare plot.
+    fn remove_other(&mut self, i: usize) {
+        if i < self.others.len() {
+            self.others.remove(i);
+            self.xy_cache = None;
+        }
+    }
+
+    fn remember_pv(&mut self, file: usize, node: usize) {
+        let path = &self.files[file].tree.nodes[node].path;
+        recent::add_pv(&mut self.recent_pvs, path);
+    }
+
+    /// The dataset at `path` in the first open file that has it.
+    fn find_pv(&self, path: &str) -> Option<Sel> {
+        self.files.iter().enumerate().find_map(|(f, of)| {
+            of.tree
+                .node_by_path(path)
+                .filter(|&i| !of.tree.nodes[i].is_group)
+                .map(|i| (f, i))
+        })
+    }
+
+    fn sel_path(&self, (f, n): Sel) -> &str {
+        &self.files[f].tree.nodes[n].path
+    }
+
+    /// Whether a PV at `path` (in any open file) is part of the current plot.
+    fn pv_selected(&self, path: &str) -> bool {
+        self.selected.is_some_and(|s| self.sel_path(s) == path)
+            || self.others.iter().any(|l| self.sel_path(l.sel()) == path)
+    }
+
+    /// Recent-PV checkbox toggled on: the PV becomes the main selection when
+    /// there is none, otherwise it joins the compare plot.
+    fn check_pv(&mut self, path: &str) {
+        let Some((f, n)) = self.find_pv(path) else { return };
+        if self.selected.is_none() {
+            self.select(f, n);
+        } else if !self.pv_selected(path) {
+            self.toggle_other(f, n);
+        }
+    }
+
+    /// Recent-PV checkbox toggled off: the PV leaves the plot. When it was
+    /// the main selection, the first extra one takes its place.
+    fn uncheck_pv(&mut self, path: &str) {
+        self.xy_cache = None;
+        self.others.retain(|l| self.files[l.file].tree.nodes[l.node].path != path);
+        if self.selected.is_some_and(|s| self.sel_path(s) == path) {
+            if self.others.is_empty() {
+                self.selected = None;
+                self.loaded = None;
+                self.multi.clear();
+            } else {
+                let l = self.others.remove(0);
+                self.selected = Some(l.sel());
+                self.loaded = Some(l);
+                self.rebuild_multi();
+            }
         }
     }
 
@@ -721,7 +797,10 @@ impl App {
     /// (interpolating hundreds of thousands of points every frame would not
     /// keep the UI at 60 fps).
     fn ensure_xy_cache(&mut self) {
-        let (Some(a), Some(b)) = (&self.loaded, &self.loaded2) else {
+        if self.others.len() != 1 {
+            return;
+        }
+        let (Some(a), Some(b)) = (&self.loaded, self.others.first()) else {
             return;
         };
         if !a.plottable() || !b.plottable() {
@@ -870,178 +949,246 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Toolbar. Its three groups (file buttons, search, status) sit on one
+    /// row when they fit, otherwise the status group and then the search
+    /// group move onto their own rows so nothing overlaps.
     fn top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("📂 Open…").clicked() {
-                    self.open_dialog(None, false);
-                }
-                if ui
-                    .button("➕ Add…")
-                    .on_hover_text("Open another file alongside, to compare PVs across files")
-                    .clicked()
-                {
-                    self.open_dialog(None, true);
-                }
-                if ui
-                    .button("🔢 Runs…")
-                    .on_hover_text(
-                        "Open runs by number (e.g. 26871-26970) — their NeXus\n\
-                         files are located automatically across all IPTS",
-                    )
-                    .clicked()
-                {
-                    self.range_popup = true;
-                    self.range_focus = true;
-                }
-                if ui
-                    .button("⌨ Path…")
-                    .on_hover_text("Type or paste a file / directory path")
-                    .clicked()
-                {
-                    // Pre-fill with the current file's directory.
-                    if self.path_input.is_empty() {
-                        if let Some(dir) = self.default_dir() {
-                            self.path_input = dir.display().to_string();
-                        }
-                    }
-                    self.path_popup = true;
-                    self.path_focus = true;
-                    self.path_error = None;
-                }
-                let mut reopen: Option<(PathBuf, bool)> = None;
-                let mut clear_recent = false;
-                ui.add_enabled_ui(!self.recent.is_empty(), |ui| {
-                    ui.menu_button("🕘 Recent", |ui| {
-                        for p in &self.recent {
-                            let name = p
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| p.display().to_string());
-                            let exists = p.exists();
-                            let resp = ui
-                                .add_enabled(exists, egui::Button::new(name))
-                                .on_hover_text(format!(
-                                    "{}\nCtrl+click: add to the open files",
-                                    p.display()
-                                ))
-                                .on_disabled_hover_text(format!(
-                                    "File not found: {}",
-                                    p.display()
-                                ));
-                            if resp.clicked() {
-                                let ctrl =
-                                    ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
-                                reopen = Some((p.clone(), ctrl && !self.files.is_empty()));
-                            }
-                        }
-                        ui.separator();
-                        if ui.button("Clear list").clicked() {
-                            clear_recent = true;
-                        }
-                    })
-                    .response
-                    .on_hover_text("Reopen one of the last files");
+            let avail = ui.available_width();
+            let gap = ui.spacing().item_spacing.x;
+            let [w_files, w_search, w_status] = self.top_widths;
+            let one_row = w_files + w_search + w_status + 2.0 * gap <= avail;
+            let two_rows = !one_row && w_files + w_search + gap <= avail;
+            let mut widths = [0.0f32; 3];
+            if one_row {
+                ui.horizontal(|ui| {
+                    widths[0] = self.top_files(ui, ctx);
+                    widths[1] = self.top_search(ui, true);
+                    widths[2] = self.top_status(ui, ctx);
                 });
-                if let Some((p, add)) = reopen {
-                    self.open_file(&p, ctx, add);
-                }
-                if clear_recent {
-                    recent::clear(&mut self.recent);
-                }
-                ui.separator();
-                ui.label("🔍");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search PVs / keywords…")
-                        .desired_width(320.0),
-                );
-                if ui
-                    .selectable_label(self.case_sensitive, RichText::new("Aa").strong())
-                    .on_hover_text("Case sensitive search")
-                    .clicked()
-                {
-                    self.case_sensitive = !self.case_sensitive;
-                }
-                if ui
-                    .add_enabled(!self.search.is_empty(), egui::Button::new("✖"))
-                    .on_hover_text("Clear search")
-                    .clicked()
-                {
-                    self.search.clear();
-                }
-                if self.filter_active() {
-                    let color = if self.total_matches == 0 {
-                        ui.visuals().error_fg_color
-                    } else if ui.visuals().dark_mode {
-                        Color32::LIGHT_GREEN
-                    } else {
-                        Color32::DARK_GREEN
-                    };
-                    ui.label(
-                        RichText::new(format!("{} match(es)", self.total_matches)).color(color),
-                    );
-                }
-                if !self.pending.is_empty() {
-                    ui.separator();
-                    ui.spinner();
-                    ui.label(format!(
-                        "opening {}/{}…",
-                        self.pending_total - self.pending.len(),
-                        self.pending_total
-                    ));
-                    if ui
-                        .small_button("✖")
-                        .on_hover_text("Stop opening the remaining files")
-                        .clicked()
-                    {
-                        self.cancel_pending();
-                    }
-                }
-                let mut close_all = false;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    theme::toggle_button(ui);
-                    zoom::toggle_button(ui);
-                    match self.files.len() {
-                        0 => {}
-                        1 => {
-                            let tree = &self.files[0].tree;
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}   ({} groups, {} datasets)",
-                                    tree.file_path.display(),
-                                    tree.n_groups,
-                                    tree.n_datasets
-                                ))
-                                .weak(),
-                            );
-                        }
-                        n => {
-                            if ui
-                                .small_button("✖ all")
-                                .on_hover_text("Close all files")
-                                .clicked()
-                            {
-                                close_all = true;
-                            }
-                            let list = self
-                                .files
-                                .iter()
-                                .map(|f| f.tree.file_path.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            ui.label(RichText::new(format!("{n} files open")).weak())
-                                .on_hover_text(list);
-                        }
-                    }
+            } else if two_rows {
+                ui.horizontal(|ui| {
+                    widths[0] = self.top_files(ui, ctx);
+                    widths[1] = self.top_search(ui, true);
                 });
-                if close_all {
-                    self.close_all(ctx);
-                }
-            });
+                ui.horizontal(|ui| widths[2] = self.top_status(ui, ctx));
+            } else {
+                ui.horizontal(|ui| widths[0] = self.top_files(ui, ctx));
+                ui.horizontal(|ui| widths[1] = self.top_search(ui, false));
+                ui.horizontal(|ui| widths[2] = self.top_status(ui, ctx));
+            }
+            // Widths from this frame decide next frame's layout; redraw once
+            // more if they changed (e.g. right after a resize or open).
+            let changed = widths
+                .iter()
+                .zip(self.top_widths.iter())
+                .any(|(a, b)| (a - b).abs() > 0.5);
+            self.top_widths = widths;
+            if changed {
+                ctx.request_repaint();
+            }
             ui.add_space(4.0);
         });
+    }
+
+    /// Open / Add / Runs / Path / Recent buttons. Returns the width used.
+    fn top_files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> f32 {
+        let resp = ui.horizontal(|ui| {
+            if ui.button("📂 Open…").clicked() {
+                self.open_dialog(None, false);
+            }
+            if ui
+                .button("➕ Add…")
+                .on_hover_text("Open another file alongside, to compare PVs across files")
+                .clicked()
+            {
+                self.open_dialog(None, true);
+            }
+            if ui
+                .button("🔢 Runs…")
+                .on_hover_text(
+                    "Open runs by number (e.g. 26871-26970) — their NeXus\n\
+                     files are located automatically across all IPTS",
+                )
+                .clicked()
+            {
+                self.range_popup = true;
+                self.range_focus = true;
+            }
+            if ui
+                .button("⌨ Path…")
+                .on_hover_text("Type or paste a file / directory path")
+                .clicked()
+            {
+                // Pre-fill with the current file's directory.
+                if self.path_input.is_empty() {
+                    if let Some(dir) = self.default_dir() {
+                        self.path_input = dir.display().to_string();
+                    }
+                }
+                self.path_popup = true;
+                self.path_focus = true;
+                self.path_error = None;
+            }
+            let mut reopen: Option<(PathBuf, bool)> = None;
+            let mut clear_recent = false;
+            ui.add_enabled_ui(!self.recent.is_empty(), |ui| {
+                ui.menu_button("🕘 Recent", |ui| {
+                    for p in &self.recent {
+                        let name = p
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.display().to_string());
+                        let exists = p.exists();
+                        let resp = ui
+                            .add_enabled(exists, egui::Button::new(name))
+                            .on_hover_text(format!(
+                                "{}\nCtrl+click: add to the open files",
+                                p.display()
+                            ))
+                            .on_disabled_hover_text(format!(
+                                "File not found: {}",
+                                p.display()
+                            ));
+                        if resp.clicked() {
+                            let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                            reopen = Some((p.clone(), ctrl && !self.files.is_empty()));
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Clear list").clicked() {
+                        clear_recent = true;
+                    }
+                })
+                .response
+                .on_hover_text("Reopen one of the last files");
+            });
+            if let Some((p, add)) = reopen {
+                self.open_file(&p, ctx, add);
+            }
+            if clear_recent {
+                recent::clear(&mut self.recent);
+            }
+        });
+        resp.response.rect.width()
+    }
+
+    /// Search box, its toggles, match count and bulk-open progress; `sep`
+    /// draws the divider from the file buttons when both share a row.
+    /// Returns the width used.
+    fn top_search(&mut self, ui: &mut egui::Ui, sep: bool) -> f32 {
+        let resp = ui.horizontal(|ui| {
+            if sep {
+                ui.separator();
+            }
+            ui.label("🔍");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Search PVs / keywords…")
+                    .desired_width(320.0),
+            );
+            if ui
+                .selectable_label(self.case_sensitive, RichText::new("Aa").strong())
+                .on_hover_text("Case sensitive search")
+                .clicked()
+            {
+                self.case_sensitive = !self.case_sensitive;
+            }
+            if ui
+                .add_enabled(!self.search.is_empty(), egui::Button::new("✖"))
+                .on_hover_text("Clear search")
+                .clicked()
+            {
+                self.search.clear();
+            }
+            if self.filter_active() {
+                let color = if self.total_matches == 0 {
+                    ui.visuals().error_fg_color
+                } else if ui.visuals().dark_mode {
+                    Color32::LIGHT_GREEN
+                } else {
+                    Color32::DARK_GREEN
+                };
+                ui.label(RichText::new(format!("{} match(es)", self.total_matches)).color(color));
+            }
+            if !self.pending.is_empty() {
+                ui.separator();
+                ui.spinner();
+                ui.label(format!(
+                    "opening {}/{}…",
+                    self.pending_total - self.pending.len(),
+                    self.pending_total
+                ));
+                if ui
+                    .small_button("✖")
+                    .on_hover_text("Stop opening the remaining files")
+                    .clicked()
+                {
+                    self.cancel_pending();
+                }
+            }
+        });
+        resp.response.rect.width()
+    }
+
+    /// Right-aligned status: theme / text-size toggles and the open file(s).
+    /// Returns the width the group wants, counting the file path at its
+    /// full length even when it had to be truncated to fit.
+    fn top_status(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> f32 {
+        let mut close_all = false;
+        let mut want = 0.0f32;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            theme::toggle_button(ui);
+            zoom::toggle_button(ui);
+            match self.files.len() {
+                0 => {}
+                1 => {
+                    let tree = &self.files[0].tree;
+                    let text = format!(
+                        "{}   ({} groups, {} datasets)",
+                        tree.file_path.display(),
+                        tree.n_groups,
+                        tree.n_datasets
+                    );
+                    let full = ui
+                        .painter()
+                        .layout_no_wrap(
+                            text.clone(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            Color32::PLACEHOLDER,
+                        )
+                        .size()
+                        .x;
+                    let resp = ui
+                        .add(egui::Label::new(RichText::new(text).weak()).truncate())
+                        .on_hover_text(tree.file_path.display().to_string());
+                    want += (full - resp.rect.width()).max(0.0);
+                }
+                n => {
+                    if ui
+                        .small_button("✖ all")
+                        .on_hover_text("Close all files")
+                        .clicked()
+                    {
+                        close_all = true;
+                    }
+                    let list = self
+                        .files
+                        .iter()
+                        .map(|f| f.tree.file_path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.label(RichText::new(format!("{n} files open")).weak())
+                        .on_hover_text(list);
+                }
+            }
+            want += ui.min_rect().width();
+        });
+        if close_all {
+            self.close_all(ctx);
+        }
+        want
     }
 
     fn left_tree(&mut self, ui: &mut egui::Ui) {
@@ -1062,13 +1209,15 @@ impl App {
                 ui.label(
                     RichText::new(if many {
                         "Click a PV to compare it across all open files;\n\
-                         Ctrl+click a second PV to plot one vs the other"
+                         Ctrl+click more PVs to plot them together"
                     } else {
-                        "Ctrl+click a second PV to plot one vs the other"
+                        "Ctrl+click a second PV to plot one vs the other,\n\
+                         more to overlay them all"
                     })
                     .weak()
                     .small(),
                 );
+                self.recent_pv_section(ui);
                 ui.separator();
                 let filter = self.filter_active();
                 // A handful of files start expanded; a 100-run range starts
@@ -1076,6 +1225,7 @@ impl App {
                 let default_open = self.files.len() <= 4;
                 let mut clicked: Option<(usize, usize, bool)> = None;
                 let mut close: Option<usize> = None;
+                let others: Vec<Sel> = self.others.iter().map(Loaded::sel).collect();
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                     for f in 0..self.files.len() {
                         let label = self.file_label(f);
@@ -1115,6 +1265,24 @@ impl App {
                                     );
                                     return;
                                 }
+                                // The file's own (root) attributes — e.g. a
+                                // normalization configuration's output_folder,
+                                // ipts, created — live on "/" which has no
+                                // header of its own: one entry for them.
+                                let root_selected = self.selected == Some((f, 0));
+                                if ui
+                                    .selectable_label(
+                                        root_selected,
+                                        RichText::new("⚙ file attributes").weak(),
+                                    )
+                                    .on_hover_text(
+                                        "Attributes of the file's root group \
+                                         (schema, provenance, output folder…)",
+                                    )
+                                    .clicked()
+                                {
+                                    clicked = Some((f, 0, false));
+                                }
                                 for &r in &of.tree.nodes[0].children.clone() {
                                     show_node(
                                         ui,
@@ -1126,7 +1294,7 @@ impl App {
                                         &of.node_match,
                                         &of.subtree_match,
                                         self.selected,
-                                        self.second,
+                                        &others,
                                         &mut clicked,
                                     );
                                 }
@@ -1136,18 +1304,20 @@ impl App {
                 });
                 if let Some((f, idx, ctrl)) = clicked {
                     // Clicking a group header selects its `value` dataset when
-                    // it has one (typical for DASlogs PVs); clicking a dataset
-                    // selects it directly. Ctrl+click picks the second PV of a
-                    // compare plot.
+                    // it has one (typical for DASlogs PVs), else the group
+                    // itself — so its attributes show (a configuration file's
+                    // `export` flags, a NeXus group's NX_class…); clicking a
+                    // dataset selects it directly. Ctrl+click adds a PV to
+                    // the compare plot (or removes it again).
                     let tree = &self.files[f].tree;
                     let target = if tree.nodes[idx].is_group {
-                        tree.child_named(idx, "value")
+                        tree.child_named(idx, "value").or(Some(idx))
                     } else {
                         Some(idx)
                     };
                     if let Some(t) = target {
                         if ctrl {
-                            self.select_second(f, t);
+                            self.toggle_other(f, t);
                         } else if self.selected != Some((f, t)) {
                             self.select(f, t);
                         }
@@ -1160,12 +1330,97 @@ impl App {
             });
     }
 
+    /// The last PVs plotted, as checkboxes above the tree: checking one
+    /// plots it again (the first checked PV is the main selection, further
+    /// ones overlay it), unchecking removes it from the plot. PVs absent
+    /// from every open file are greyed out.
+    fn recent_pv_section(&mut self, ui: &mut egui::Ui) {
+        if self.recent_pvs.is_empty() {
+            return;
+        }
+        let mut toggled: Option<(String, bool)> = None;
+        let mut clear = false;
+        let mut uncheck_all = false;
+        let n_checked = self.recent_pvs.iter().filter(|p| self.pv_selected(p)).count();
+        let title = if n_checked > 0 {
+            format!("🕘 Recent PVs ({} checked)", n_checked)
+        } else {
+            format!("🕘 Recent PVs ({})", self.recent_pvs.len())
+        };
+        egui::CollapsingHeader::new(title)
+            .id_salt("recent_pvs")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Check any number of PVs to plot them again; the first\n\
+                         checked one is the main PV, the others overlay it.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("recent_pvs_list")
+                    .max_height(180.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for path in &self.recent_pvs {
+                            let present = self.find_pv(path).is_some();
+                            let mut on = self.pv_selected(path);
+                            let text = RichText::new(pv_display(path)).monospace();
+                            let resp = ui
+                                .add_enabled(present, egui::Checkbox::new(&mut on, text))
+                                .on_hover_text(path.as_str())
+                                .on_disabled_hover_text(format!(
+                                    "{path}\nNot in the open files"
+                                ));
+                            if resp.changed() {
+                                toggled = Some((path.clone(), on));
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(n_checked > 0, egui::Button::new("Uncheck all").small())
+                        .on_hover_text("Clear the selection")
+                        .clicked()
+                    {
+                        uncheck_all = true;
+                    }
+                    if ui
+                        .small_button("Clear list")
+                        .on_hover_text("Forget the recent PVs")
+                        .clicked()
+                    {
+                        clear = true;
+                    }
+                });
+            });
+        if let Some((path, on)) = toggled {
+            if on {
+                self.check_pv(&path);
+            } else {
+                self.uncheck_pv(&path);
+            }
+        }
+        if uncheck_all {
+            self.selected = None;
+            self.loaded = None;
+            self.others.clear();
+            self.multi.clear();
+            self.xy_cache = None;
+        }
+        if clear {
+            recent::clear_pvs(&mut self.recent_pvs);
+        }
+    }
+
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         self.ensure_xy_cache();
         let mut mode = self.compare_mode;
         let mut swap = self.swap_xy;
         let mut norm = self.normalize;
-        let mut clear_second = false;
+        let mut remove_other: Option<usize> = None;
         let mut dismiss_error = false;
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = &self.error {
@@ -1183,7 +1438,9 @@ impl App {
                     RichText::new(
                         "Select a dataset in the tree to view it.\n\
                          With several files open, it is compared across all of them.\n\
-                         Ctrl+click a second one to plot one PV against another.",
+                         Ctrl+click a second one to plot one PV against another,\n\
+                         more of them to overlay several.\n\
+                         Recent PVs can be re-checked from the list above the tree.",
                     )
                     .weak(),
                 );
@@ -1200,16 +1457,14 @@ impl App {
                 .id_salt("dataset_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    self.dataset_content(ui, panel_h, &mut mode, &mut swap, &mut norm, &mut clear_second);
+                    self.dataset_content(ui, panel_h, &mut mode, &mut swap, &mut norm, &mut remove_other);
                 });
         });
         self.compare_mode = mode;
         self.swap_xy = swap;
         self.normalize = norm;
-        if clear_second {
-            self.second = None;
-            self.loaded2 = None;
-            self.xy_cache = None;
+        if let Some(i) = remove_other {
+            self.remove_other(i);
         }
         if dismiss_error {
             self.error = None;
@@ -1226,15 +1481,16 @@ impl App {
         mode: &mut CompareMode,
         swap: &mut bool,
         norm: &mut bool,
-        clear_second: &mut bool,
+        remove_other: &mut Option<usize>,
     ) {
         let Some(loaded) = &self.loaded else { return };
         let many = self.files.len() > 1;
         let tree = &self.files[loaded.file].tree;
         let node = &tree.nodes[loaded.node];
+        let compare = !self.others.is_empty();
 
         ui.horizontal(|ui| {
-            if self.loaded2.is_some() {
+            if compare {
                 ui.label(RichText::new("[1]").strong());
                 if many {
                     ui.label(RichText::new(self.file_label(loaded.file)).strong());
@@ -1245,77 +1501,114 @@ impl App {
                 ui.ctx().copy_text(node.path.clone());
             }
         });
-        if let Some(l2) = &self.loaded2 {
-            let node2 = &self.files[l2.file].tree.nodes[l2.node];
+        for (k, l) in self.others.iter().enumerate() {
+            let node_k = &self.files[l.file].tree.nodes[l.node];
             ui.horizontal(|ui| {
-                ui.label(RichText::new("[2]").strong());
+                ui.label(RichText::new(format!("[{}]", k + 2)).strong());
                 if many {
-                    ui.label(RichText::new(self.file_label(l2.file)).strong());
+                    ui.label(RichText::new(self.file_label(l.file)).strong());
                 }
-                ui.label(RichText::new(&node2.path).monospace().strong());
+                ui.label(RichText::new(&node_k.path).monospace().strong());
                 if ui.small_button("📋").on_hover_text("Copy path").clicked() {
-                    ui.ctx().copy_text(node2.path.clone());
+                    ui.ctx().copy_text(node_k.path.clone());
                 }
-                if ui.small_button("✖").on_hover_text("Remove second selection").clicked() {
-                    *clear_second = true;
+                if ui.small_button("✖").on_hover_text("Remove from the plot").clicked() {
+                    *remove_other = Some(k);
                 }
             });
         }
 
-        // Compare view when a second plottable PV is selected.
-        if let Some(l2) = &self.loaded2 {
-            if loaded.plottable() && l2.plottable() {
+        // Compare view: one extra plottable PV pairs with the main one (x-y)
+        // or overlays it; several extra ones all overlay it.
+        if compare {
+            let warn = ui.visuals().warn_fg_color;
+            let extra: Vec<(usize, &Loaded)> = self
+                .others
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.plottable())
+                .map(|(k, l)| (k + 2, l))
+                .collect();
+            for (k, l) in self.others.iter().enumerate() {
+                if !l.plottable() {
+                    ui.colored_label(
+                        warn,
+                        format!("[{}] has no plottable 1-D array — left out.", k + 2),
+                    );
+                }
+            }
+            if loaded.plottable() && !extra.is_empty() {
                 ui.separator();
+                let pair = self.others.len() == 1;
+                let overlay = !pair || *mode == CompareMode::Overlay;
                 ui.horizontal(|ui| {
                     ui.label("Plot:");
-                    ui.selectable_value(mode, CompareMode::Xy, "1 vs 2");
-                    ui.selectable_value(mode, CompareMode::Overlay, "both as y");
-                    match *mode {
-                        CompareMode::Xy => {
-                            if ui.button("swap axes").clicked() {
-                                *swap = !*swap;
-                            }
-                        }
-                        CompareMode::Overlay => {
-                            ui.checkbox(norm, "normalize [0–1]");
-                        }
+                    if pair {
+                        ui.selectable_value(mode, CompareMode::Xy, "1 vs 2");
+                        ui.selectable_value(mode, CompareMode::Overlay, "both as y");
+                    } else {
+                        ui.label(format!("all {} as y", extra.len() + 1));
+                    }
+                    if overlay {
+                        ui.checkbox(norm, "normalize [0–1]");
+                    } else if ui.button("swap axes").clicked() {
+                        *swap = !*swap;
                     }
                 });
                 if let Some(s) = &loaded.stats {
                     stats_line(ui, "[1] ", s);
                 }
-                if let Some(s) = &l2.stats {
-                    stats_line(ui, "[2] ", s);
+                for (k, l) in &extra {
+                    if let Some(s) = &l.stats {
+                        stats_line(ui, &format!("[{k}] "), s);
+                    }
                 }
                 ui.add_space(4.0);
-                match *mode {
-                    CompareMode::Xy => {
-                        let key = (loaded.sel(), l2.sel(), *swap);
-                        draw_xy(ui, self.xy_cache.as_ref(), key, panel_h);
-                    }
-                    CompareMode::Overlay => draw_overlay(ui, loaded, l2, *norm, panel_h),
+                if overlay {
+                    let mut series = vec![(1, loaded)];
+                    series.extend(extra.iter().copied());
+                    draw_overlay(ui, &series, *norm, panel_h);
+                } else {
+                    let key = (loaded.sel(), extra[0].1.sel(), *swap);
+                    draw_xy(ui, self.xy_cache.as_ref(), key, panel_h);
                 }
                 return;
             }
-            let color = ui.visuals().warn_fg_color;
-            ui.colored_label(
-                color,
-                "The 2nd selection has no plottable 1-D array — showing the 1st only.",
-            );
+            if !loaded.plottable() {
+                ui.colored_label(
+                    warn,
+                    "The 1st selection has no plottable 1-D array — showing it alone.",
+                );
+            }
         }
 
         // Cross-file view: the selected PV in every open file.
-        if many && self.loaded2.is_none() {
+        if many && !compare {
             let labels: Vec<String> =
                 (0..self.files.len()).map(|f| self.file_label(f)).collect();
             draw_multi(ui, &self.multi, &labels, norm, panel_h);
             return;
         }
 
-        ui.label(
-            RichText::new(format!("dtype: {}   shape: {:?}", node.dtype, node.shape)).weak(),
-        );
+        if node.is_group {
+            ui.label(
+                RichText::new(format!(
+                    "group — {} member(s){}",
+                    node.children.len(),
+                    if node.path == "/" { " (file root)" } else { "" }
+                ))
+                .weak(),
+            );
+        } else {
+            ui.label(
+                RichText::new(format!("dtype: {}   shape: {:?}", node.dtype, node.shape))
+                    .weak(),
+            );
+        }
 
+        if node.is_group && loaded.attrs.is_empty() {
+            ui.label(RichText::new("(no attributes)").weak());
+        }
         if !loaded.attrs.is_empty() {
             egui::CollapsingHeader::new(format!("Attributes ({})", loaded.attrs.len()))
                 .default_open(true)
@@ -1332,6 +1625,15 @@ impl App {
         ui.separator();
 
         match &loaded.value {
+            Value::Empty if node.is_group => {
+                ui.label(
+                    RichText::new(
+                        "A group holds no data of its own — its attributes are listed \
+                         above; expand it in the tree for its members.",
+                    )
+                    .weak(),
+                );
+            }
             Value::Empty => {
                 ui.label(RichText::new("(empty dataset)").weak());
             }
@@ -1503,6 +1805,17 @@ mod run_range_tests {
         assert_eq!(parse_run_ranges(""), None);
         assert_eq!(parse_run_ranges("abc"), None);
         assert_eq!(parse_run_ranges("26871-"), None);
+    }
+
+    #[test]
+    fn pv_display_names() {
+        assert_eq!(pv_display("/entry/DASlogs/BL10:SE:Temp/value"), "BL10:SE:Temp");
+        assert_eq!(
+            pv_display("/entry/DASlogs/BL10:SE:Temp/average_value"),
+            "BL10:SE:Temp/average_value"
+        );
+        assert_eq!(pv_display("/entry/title"), "entry/title");
+        assert_eq!(pv_display("/title"), "title");
     }
 
     #[test]
@@ -1695,6 +2008,19 @@ fn draw_multi(
                 plot_ui.line(Line::new(y_label.clone(), PlotPoints::from(pts.clone())));
                 plot_ui.points(Points::new(y_label, PlotPoints::from(pts)).radius(3.0));
             });
+    }
+}
+
+/// Short name of a PV for the recent list: the group name for a DASlogs
+/// `value` dataset, else `parent/name`.
+fn pv_display(path: &str) -> String {
+    let mut parts = path.rsplit('/');
+    let last = parts.next().unwrap_or(path);
+    let parent = parts.next().filter(|p| !p.is_empty());
+    match parent {
+        Some(p) if last == "value" => p.to_string(),
+        Some(p) => format!("{p}/{last}"),
+        None => last.to_string(),
     }
 }
 
@@ -1893,29 +2219,37 @@ fn draw_xy(ui: &mut egui::Ui, cache: Option<&XyCache>, key: (Sel, Sel, bool), pa
         });
 }
 
-fn draw_overlay(ui: &mut egui::Ui, a: &Loaded, b: &Loaded, normalize: bool, panel_h: f32) {
-    let x_label = if a.x_label == b.x_label {
-        a.x_label.clone()
-    } else {
-        format!("{} / {}", a.x_label, b.x_label)
-    };
+/// Several PVs as y-curves over their own x axes, each labelled with its
+/// selection number.
+fn draw_overlay(ui: &mut egui::Ui, series: &[(usize, &Loaded)], normalize: bool, panel_h: f32) {
+    let mut x_labels: Vec<&str> = series.iter().map(|(_, l)| l.x_label.as_str()).collect();
+    x_labels.dedup();
+    let x_label = x_labels.join(" / ");
+    let mut units: Vec<&str> =
+        series.iter().map(|(_, l)| l.units.as_deref().unwrap_or("")).collect();
+    units.dedup();
     let y_label = if normalize {
         "normalized [0–1]".to_string()
+    } else if let [u] = units[..] {
+        u.to_string()
     } else {
-        match (&a.units, &b.units) {
-            (Some(u), Some(v)) if u == v => u.clone(),
-            _ => String::new(),
-        }
+        String::new()
     };
-    let series = |l: &Loaded, n: &str| -> Line {
-        let pts = match (normalize, &l.stats) {
-            (true, Some(s)) => norm_points(&l.points, s),
-            _ => l.points.clone(),
-        };
-        Line::new(format!("{n} {}", series_label(l)), PlotPoints::from(pts))
-    };
-    let la = series(a, "[1]");
-    let lb = series(b, "[2]");
+    // Cap the total point count so many overlaid PVs still redraw fast.
+    let per_line = (200_000 / series.len().max(1)).max(1_000);
+    let lines: Vec<Line> = series
+        .iter()
+        .map(|(n, l)| {
+            let pts = match (normalize, &l.stats) {
+                (true, Some(s)) => norm_points(&l.points, s),
+                _ => l.points.clone(),
+            };
+            Line::new(
+                format!("[{n}] {}", series_label(l)),
+                PlotPoints::from(stride_cap(pts, per_line)),
+            )
+        })
+        .collect();
     Plot::new("overlay_plot")
         .legend(Legend::default())
         .x_axis_label(x_label)
@@ -1923,8 +2257,9 @@ fn draw_overlay(ui: &mut egui::Ui, a: &Loaded, b: &Loaded, normalize: bool, pane
         .allow_boxed_zoom(true)
         .height(plot_height(ui, panel_h))
         .show(ui, |plot_ui| {
-            plot_ui.line(la);
-            plot_ui.line(lb);
+            for line in lines {
+                plot_ui.line(line);
+            }
         });
 }
 
@@ -1944,7 +2279,7 @@ fn show_node(
     node_match: &[bool],
     subtree_match: &[bool],
     selected: Option<Sel>,
-    second: Option<Sel>,
+    others: &[Sel],
     clicked: &mut Option<(usize, usize, bool)>,
 ) {
     if filter && !ancestor_matched && !subtree_match[idx] {
@@ -1972,7 +2307,7 @@ fn show_node(
         let resp = header.show(ui, |ui| {
             for &c in &node.children {
                 show_node(ui, tree, file, c, filter, ancestor_matched || matched,
-                          node_match, subtree_match, selected, second, clicked);
+                          node_match, subtree_match, selected, others, clicked);
             }
         });
         if resp.header_response.clicked() {
@@ -1988,14 +2323,14 @@ fn show_node(
                 node.shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("×")
             )
         };
-        let is_second = second == Some((file, idx));
+        let other = others.iter().position(|&s| s == (file, idx));
         let mut text = RichText::new(format!(
             "{}{dims}{}",
             node.name,
-            if is_second { "  [2]" } else { "" }
+            other.map(|k| format!("  [{}]", k + 2)).unwrap_or_default()
         ))
         .monospace();
-        if is_second {
+        if other.is_some() {
             text = text
                 .color(if ui.visuals().dark_mode {
                     Color32::from_rgb(110, 200, 255)
