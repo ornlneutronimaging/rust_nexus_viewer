@@ -266,7 +266,7 @@ pub fn format_value_short(v: &Value, max_items: usize) -> String {
 
 pub fn format_num(v: f64) -> String {
     if v == v.trunc() && v.abs() < 1e15 {
-        format!("{}", v as i64)
+        group_thousands(v as i64)
     } else if v != 0.0 && (v.abs() >= 1e6 || v.abs() < 1e-4) {
         format!("{v:.6e}")
     } else {
@@ -274,9 +274,44 @@ pub fn format_num(v: f64) -> String {
     }
 }
 
+/// Integers of a million or more get a comma every three digits
+/// (1772330595820 → 1,772,330,595,820); smaller ones — run numbers,
+/// counts — stay plain.
+fn group_thousands(v: i64) -> String {
+    let digits = v.abs().to_string();
+    if v.abs() < 1_000_000 {
+        return v.to_string();
+    }
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if v < 0 {
+        out.push('-');
+    }
+    let head = digits.len() % 3;
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (i + 3 - head) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_integers_are_grouped() {
+        assert_eq!(format_num(1772330595820.0), "1,772,330,595,820");
+        assert_eq!(format_num(1000000.0), "1,000,000");
+        assert_eq!(format_num(-1234567.0), "-1,234,567");
+        assert_eq!(format_num(999999.0), "999999");
+        assert_eq!(format_num(19709.0), "19709");
+        assert_eq!(format_num(0.0), "0");
+        assert_eq!(format_num(2.5e7), "25,000,000");
+        assert_eq!(format_num(1.5e16), "1.500000e16");
+        assert_eq!(format_num(0.5), "0.500000");
+    }
 
     const SAMPLE: &str = "/SNS/VENUS/IPTS-38715/nexus/VENUS_26871.nxs.h5";
 
