@@ -27,15 +27,20 @@ several at once) opens them all, ready to compare.
   - clicking a PV *group* (e.g. `BL10:CHOP:TCERO:ActualSpeed`) directly shows
     its `value` dataset.
 - **Attributes** of the selected dataset are listed above the value.
-- **Compare two PVs**: Ctrl+click a second dataset (marked `[2]` in the
+- **Compare PVs**: Ctrl+click a second dataset (marked `[2]` in the
   tree), then choose
   - **1 vs 2** — one PV against the other (scatter). PVs logged at different
     times are paired by linearly interpolating the y PV onto the x PV's time
     grid; **swap axes** flips which one is x.
   - **both as y** — the two curves overlaid over time, with a legend and an
     optional *normalize [0–1]* checkbox for PVs of very different magnitudes.
-  Ctrl+click the `[2]` entry again (or the ✖ button) to leave compare mode.
-  The two PVs may live in two different files.
+  Ctrl+click more datasets (`[3]`, `[4]`, …) to overlay any number of PVs
+  as y-curves. Ctrl+click an entry again (or its ✖ button) to drop it from
+  the plot. The PVs may live in different files.
+- **Recent PVs**: the last 20 PVs plotted are listed above the tree
+  (persisted across restarts). Check any number of them to plot them again
+  — the first checked one is the main PV, the others overlay it — and
+  uncheck to drop them; PVs absent from the open files are greyed out.
 - **Compare PVs across files**: open more files with **➕ Add…** (or
   Ctrl+click in the 🕘 Recent menu, or Ctrl+drop, or drop several files at
   once — the 📂/➕ dialogs also allow Ctrl/Shift multi-select). Each file
