@@ -22,10 +22,24 @@ several at once) opens them all, ready to compare.
 - **Click a dataset** to display it on the right:
   - scalars and strings are shown as text (with `units` when present),
   - 1-D arrays are plotted (drag to pan, scroll to zoom, double-click to
-    reset, right-drag for box zoom), with n/min/max/mean stats,
+    reset, right-drag for box zoom), with n/min/max/mean stats, and their
+    values are listed in a table beside the plot (index, time when the
+    PV has one, value; 📋 copies the whole table tab-separated),
+  - 2-D arrays are shown as a false-colour image (viridis, NaN in grey)
+    with a colour bar; hovering a pixel prints its column, row and value.
+    Row 0 is at the top, as in an image. Sibling `x_edges`/`y_edges`
+    datasets with uniform spacing (as in the strain maps) put the axes in
+    those coordinates,
   - DASlogs-style PVs are plotted against their sibling `time` dataset,
   - clicking a PV *group* (e.g. `BL10:CHOP:TCERO:ActualSpeed`) directly shows
     its `value` dataset.
+- **Export**: next to the dtype/shape line, **💾 CSV…** saves a 1-D array
+  (index, time when the PV has one, value) as CSV, and **💾 TIFF…** saves
+  a 2-D array as a 32-bit float grey TIFF (readable by ImageJ, tifffile…).
+  When sibling groups hold a same-named 2-D array — the `strain` map of
+  every tag `000`, `001`, … under `projections` — **💾 all N 'strain'
+  under projections…** asks for a destination folder, creates a
+  `projections` folder inside it and writes one `<tag>.tiff` per group.
 - **Attributes** of the selected dataset are listed above the value.
 - **Compare PVs**: Ctrl+click a second dataset (marked `[2]` in the
   tree), then choose
@@ -78,6 +92,14 @@ cargo build --release      # binary at target/release/nexus_viewer
 cargo test --release       # reads the sample VENUS_26871.nxs.h5 run
 ```
 
+## Log
+
+Every session appends to `/SNS/VENUS/shared/log/nexus_viewer_<user>.log`:
+the command line, each file opened or closed (with its group/dataset counts),
+the PVs selected and compared, every export with its destination, and any
+error (file that failed to open, failed export, crash). The file is readable
+in the Log Browser (`rust_log_browser`) alongside the other VENUS tools' logs.
+
 ## Code layout
 
 - `src/h5io.rs` — walks the HDF5 file into a node arena (tree), reads
@@ -85,3 +107,4 @@ cargo test --release       # reads the sample VENUS_26871.nxs.h5 run
   variable-length strings), formats values.
 - `src/main.rs` — eframe/egui application: search/filter logic, tree panel,
   value panel with egui_plot plotting, min/max decimation.
+- `src/logger.rs` — append-only shared VENUS log (see *Log* above).

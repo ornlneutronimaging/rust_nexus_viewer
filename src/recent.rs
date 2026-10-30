@@ -49,7 +49,9 @@ fn save_lines(name: &str, lines: impl Iterator<Item = String>) {
         text.push_str(&l);
         text.push('\n');
     }
-    let _ = std::fs::write(path, text);
+    if let Err(e) = std::fs::write(&path, text) {
+        crate::logger::warn(format!("Recent list not saved to {}: {e}", path.display()));
+    }
 }
 
 pub fn load() -> Vec<PathBuf> {

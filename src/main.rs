@@ -2,20 +2,44 @@
 //! the right, with a search bar to narrow the tree down to matching PVs.
 //! Several files can be open at once to compare the same PV across runs.
 
+mod export;
 mod h5io;
+mod logger;
 mod recent;
 mod theme;
 mod zoom;
 
 use eframe::egui;
 use egui::{Color32, RichText};
-use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
+use egui_plot::{Legend, Line, Plot, PlotImage, PlotPoint, PlotPoints, Points};
 use h5io::{format_num, Tree, Value};
 use std::collections::VecDeque;
+use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn main() -> eframe::Result {
+    // Shared VENUS log (nexus_viewer_<user>.log), so what a user did and
+    // where it failed can be read back in the log browser.
+    if let Err(e) = logger::init() {
+        eprintln!("Warning: logging disabled — {e}");
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    logger::log(format!(
+        "Command line: nexus_viewer {}",
+        if argv.is_empty() { "(no arguments)".to_owned() } else { argv.join(" ") }
+    ));
+    if let Ok(cwd) = std::env::current_dir() {
+        logger::log(format!("Working directory: {}", cwd.display()));
+    }
+    // A crash (panic) is the error users report most often without being
+    // able to say what happened: record it before the default hook prints
+    // it to the terminal nobody is looking at.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logger::error(format!("PANIC: {info}"));
+        default_hook(info);
+    }));
     let arg_paths: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -23,7 +47,7 @@ fn main() -> eframe::Result {
             .with_title("NeXus Viewer"),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "NeXus Viewer",
         options,
         Box::new(move |cc| {
@@ -36,7 +60,12 @@ fn main() -> eframe::Result {
             app.enqueue_opens(arg_paths, false);
             Ok(Box::new(app))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => logger::log("Application closed"),
+        Err(e) => logger::error(format!("Application failed: {e}")),
+    }
+    result
 }
 
 /// A dataset selection: (open-file index, node index in that file's tree).
@@ -69,6 +98,60 @@ struct Loaded {
     points: Vec<[f64; 2]>,
     x_label: String,
     stats: Option<Stats>,
+    /// 2-D numeric data ready to show as an image.
+    image: Option<Image2D>,
+}
+
+/// A 2-D numeric dataset laid out for display: row-major values (HDF5 C
+/// order, first dimension = row). Row 0 is drawn at the top, as in an image
+/// (the y axis of the plot is negated so its ticks still read top-down).
+/// The axes are the column/row indices, or the coordinates of uniform
+/// sibling `x_edges`/`y_edges` datasets when the file has them.
+struct Image2D {
+    rows: usize,
+    cols: usize,
+    data: Vec<f64>,
+    /// Colour range: the finite minimum and maximum.
+    vmin: f64,
+    vmax: f64,
+    n_nan: usize,
+    /// Data coordinate of the left/top edge and the size of one pixel.
+    x0: f64,
+    dx: f64,
+    y0: f64,
+    dy: f64,
+    /// Whether the axes carry real coordinates (edges) rather than indices.
+    has_edges: bool,
+    x_label: String,
+    y_label: String,
+}
+
+impl Image2D {
+    /// (col, row, value) under a plot coordinate, if it is on the image.
+    fn pick(&self, p: PlotPoint) -> Option<(usize, usize, f64)> {
+        let fx = (p.x - self.x0) / self.dx;
+        let fy = (-p.y - self.y0) / self.dy;
+        if fx < 0.0 || fy < 0.0 {
+            return None;
+        }
+        let (c, r) = (fx as usize, fy as usize);
+        if c >= self.cols || r >= self.rows {
+            return None;
+        }
+        Some((c, r, self.data[r * self.cols + c]))
+    }
+
+    /// Centre of the image in plot coordinates (y negated: row 0 on top).
+    fn center(&self) -> PlotPoint {
+        PlotPoint::new(
+            self.x0 + self.dx * self.cols as f64 / 2.0,
+            -(self.y0 + self.dy * self.rows as f64 / 2.0),
+        )
+    }
+
+    fn size(&self) -> egui::Vec2 {
+        egui::Vec2::new((self.dx * self.cols as f64) as f32, (self.dy * self.rows as f64) as f32)
+    }
 }
 
 impl Loaded {
@@ -81,7 +164,20 @@ impl Loaded {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Default)]
+/// Export requested from the dataset view, run once the panel closes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Export {
+    /// The selected 1-D array (index, time, value) to a CSV file.
+    Csv,
+    /// The selected 2-D array to one TIFF image.
+    Tiff,
+    /// The same-named 2-D array of every sibling group (e.g. `strain` of
+    /// every tag under `projections`) to one TIFF image each, in a folder
+    /// named after the parent-of-parent group.
+    TiffAll,
+}
+
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
 enum CompareMode {
     /// One PV against the other (paired via time interpolation or by index).
     #[default]
@@ -113,6 +209,8 @@ struct Stats {
 struct App {
     files: Vec<OpenFile>,
     error: Option<String>,
+    /// Confirmation of the last export (shown like an error, in plain text).
+    notice: Option<String>,
     search: String,
     case_sensitive: bool,
     /// (query, case_sensitive, generation) the match arrays were computed for.
@@ -133,6 +231,9 @@ struct App {
     swap_xy: bool,
     normalize: bool,
     xy_cache: Option<XyCache>,
+    /// GPU texture of the selected 2-D dataset (rebuilt when the selection
+    /// changes).
+    image_tex: Option<(Sel, egui::TextureHandle)>,
     /// Most-recently opened files, newest first (persisted across restarts).
     recent: Vec<PathBuf>,
     /// Dataset paths of the most-recently plotted PVs, newest first
@@ -156,6 +257,9 @@ struct App {
     range_key: Option<(String, String)>,
     range_matches: Vec<PathBuf>,
     range_error: Option<String>,
+    /// (run list, error) already written to the log, so a bad run list is
+    /// logged once when the field is committed, never while typing.
+    range_error_logged: Option<(String, String)>,
     /// Extra info about the matches ("from 3 IPTS; 2 runs not found").
     range_note: Option<String>,
     /// Run → NeXus file index over every IPTS of the instrument, used when
@@ -189,10 +293,18 @@ impl App {
     fn open_file_inner(&mut self, path: &Path, ctx: &egui::Context, add: bool) -> bool {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if add && self.files.iter().any(|f| f.canon == canon) {
+            logger::log(format!("Already open, skipped: {}", path.display()));
             return false; // already open
         }
         match h5io::load(path) {
             Ok(tree) => {
+                logger::log(format!(
+                    "Opened {} ({} groups, {} datasets){}",
+                    path.display(),
+                    tree.n_groups,
+                    tree.n_datasets,
+                    if add { " [added]" } else { "" }
+                ));
                 if !add {
                     self.files.clear();
                     self.selected = None;
@@ -215,6 +327,7 @@ impl App {
                 true
             }
             Err(e) => {
+                logger::error(format!("Cannot open {}: {e:#}", path.display()));
                 self.error = Some(format!("{e:#}"));
                 false
             }
@@ -226,6 +339,15 @@ impl App {
     fn enqueue_opens(&mut self, paths: Vec<PathBuf>, add: bool) {
         if paths.is_empty() {
             return;
+        }
+        if paths.len() > 1 {
+            logger::log(format!(
+                "Opening {} files ({} … {}){}",
+                paths.len(),
+                paths[0].display(),
+                paths[paths.len() - 1].display(),
+                if add { " [added to the open files]" } else { "" }
+            ));
         }
         if !add {
             self.files.clear();
@@ -264,12 +386,18 @@ impl App {
     }
 
     fn cancel_pending(&mut self) {
+        logger::log(format!(
+            "Stop opening: {} of {} file(s) skipped",
+            self.pending.len(),
+            self.pending_total
+        ));
         self.pending.clear();
         self.pending_total = 0;
         self.rebuild_multi();
     }
 
     fn close_all(&mut self, ctx: &egui::Context) {
+        logger::log(format!("Close all: {} file(s)", self.files.len()));
         self.files.clear();
         self.pending.clear();
         self.pending_total = 0;
@@ -294,6 +422,7 @@ impl App {
     }
 
     fn close_file(&mut self, f: usize, ctx: &egui::Context) {
+        logger::log(format!("Closed {}", self.files[f].tree.file_path.display()));
         self.files.remove(f);
         self.generation += 1;
         self.computed_for = None;
@@ -360,8 +489,19 @@ impl App {
             dialog = dialog.set_directory(dir);
         }
         // Multi-select: Ctrl/Shift+click picks several files at once.
-        if let Some(paths) = dialog.pick_files() {
-            self.enqueue_opens(paths, add);
+        match dialog.pick_files() {
+            Some(paths) => {
+                logger::log(format!(
+                    "{}: {} file(s) picked",
+                    if add { "Add" } else { "Open" },
+                    paths.len()
+                ));
+                self.enqueue_opens(paths, add);
+            }
+            None => logger::log(format!(
+                "{}: dialog cancelled",
+                if add { "Add" } else { "Open" }
+            )),
         }
     }
 
@@ -379,14 +519,17 @@ impl App {
         }
         let path = PathBuf::from(&typed);
         if path.is_file() {
+            logger::log(format!("Path typed: {}", path.display()));
             self.path_popup = false;
             self.path_error = None;
             self.open_file(&path, ctx, add);
         } else if path.is_dir() {
+            logger::log(format!("Path typed (directory, browsing it): {}", path.display()));
             self.path_popup = false;
             self.path_error = None;
             self.open_dialog(Some(&path), add);
         } else {
+            logger::error(format!("Path typed, not found: {}", path.display()));
             self.path_error = Some(format!("Not found: {}", path.display()));
         }
     }
@@ -526,11 +669,29 @@ impl App {
             }
             ui.add_space(6.0);
             let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // A run list that does not parse is logged when the field is
+            // committed (Enter, focus leaving it), once per distinct text —
+            // not on every keystroke.
+            if resp.lost_focus() && !self.range_input.trim().is_empty() {
+                if let Some(err) = &self.range_error {
+                    let entry = (self.range_input.trim().to_owned(), err.clone());
+                    if self.range_error_logged.as_ref() != Some(&entry) {
+                        logger::warn(format!("Runs: {} — '{}'", entry.1, entry.0));
+                        self.range_error_logged = Some(entry);
+                    }
+                }
+            }
             let any = !self.range_matches.is_empty();
             ui.horizontal(|ui| {
                 if ui.add_enabled(any, egui::Button::new("Open")).clicked() || (entered && any)
                 {
                     self.range_popup = false;
+                    logger::log(format!(
+                        "Runs: open {} file(s) for '{}'{}",
+                        self.range_matches.len(),
+                        self.range_input.trim(),
+                        self.range_dir_note()
+                    ));
                     self.enqueue_opens(self.range_matches.clone(), false);
                 }
                 if ui
@@ -539,6 +700,12 @@ impl App {
                     .clicked()
                 {
                     self.range_popup = false;
+                    logger::log(format!(
+                        "Runs: add {} file(s) for '{}'{}",
+                        self.range_matches.len(),
+                        self.range_input.trim(),
+                        self.range_dir_note()
+                    ));
                     self.enqueue_opens(self.range_matches.clone(), true);
                 }
                 if ui.button("Cancel").clicked() {
@@ -551,10 +718,21 @@ impl App {
         }
     }
 
+    /// " in <dir>" for the log when the run popup searches one directory.
+    fn range_dir_note(&self) -> String {
+        let dir = self.range_dir.trim();
+        if dir.is_empty() { String::new() } else { format!(" in {dir}") }
+    }
+
     /// Recompute the run-popup match list when its inputs changed.
     fn update_range_matches(&mut self) {
         // Collect a finished IPTS scan and recompute with the fresh index.
         if let Some(Ok(idx)) = self.index_rx.as_ref().map(|rx| rx.try_recv()) {
+            logger::log(format!(
+                "Run index scan finished: {} run(s) under {}",
+                idx.by_run.len(),
+                idx.root.display()
+            ));
             self.run_index = Some(idx);
             self.index_rx = None;
             self.range_key = None;
@@ -638,6 +816,10 @@ impl App {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.index_rx = Some(rx);
+        logger::log(format!(
+            "Run index scan started (background): {}/IPTS-*/nexus",
+            root.display()
+        ));
         std::thread::spawn(move || {
             let _ = tx.send(build_run_index(&root));
         });
@@ -690,6 +872,11 @@ impl App {
     }
 
     fn select(&mut self, file: usize, node: usize) {
+        logger::log(format!(
+            "Selected {} {}",
+            self.file_label(file),
+            self.files[file].tree.nodes[node].path
+        ));
         self.selected = Some((file, node));
         self.xy_cache = None;
         self.loaded = Some(load_node(&self.files[file].tree, file, node));
@@ -704,8 +891,18 @@ impl App {
     fn toggle_other(&mut self, file: usize, node: usize) {
         self.xy_cache = None;
         if let Some(i) = self.others.iter().position(|l| l.sel() == (file, node)) {
+            logger::log(format!(
+                "Compare: removed {} {}",
+                self.file_label(file),
+                self.files[file].tree.nodes[node].path
+            ));
             self.others.remove(i);
         } else if self.selected != Some((file, node)) {
+            logger::log(format!(
+                "Compare: added {} {}",
+                self.file_label(file),
+                self.files[file].tree.nodes[node].path
+            ));
             self.others.push(load_node(&self.files[file].tree, file, node));
             self.remember_pv(file, node);
         }
@@ -714,6 +911,11 @@ impl App {
     /// Drop the `i`-th extra selection of the compare plot.
     fn remove_other(&mut self, i: usize) {
         if i < self.others.len() {
+            logger::log(format!(
+                "Compare: removed {} {}",
+                self.file_label(self.others[i].file),
+                self.sel_path(self.others[i].sel())
+            ));
             self.others.remove(i);
             self.xy_cache = None;
         }
@@ -758,6 +960,7 @@ impl App {
     /// Recent-PV checkbox toggled off: the PV leaves the plot. When it was
     /// the main selection, the first extra one takes its place.
     fn uncheck_pv(&mut self, path: &str) {
+        logger::log(format!("Recent PV unchecked: {path}"));
         self.xy_cache = None;
         self.others.retain(|l| self.files[l.file].tree.nodes[l.node].path != path);
         if self.selected.is_some_and(|s| self.sel_path(s) == path) {
@@ -813,6 +1016,65 @@ impl App {
         let cache = build_xy(a, b, self.swap_xy);
         self.xy_cache = Some(cache);
     }
+
+    /// Upload the selected 2-D dataset as a texture (once per selection).
+    fn ensure_image_texture(&mut self, ctx: &egui::Context) {
+        let Some((sel, img)) = self.loaded.as_ref().and_then(|l| l.image.as_ref().map(|i| (l.sel(), i)))
+        else {
+            self.image_tex = None;
+            return;
+        };
+        if self.image_tex.as_ref().is_some_and(|(s, _)| *s == sel) {
+            return;
+        }
+        let tex = ctx.load_texture("dataset_image", color_image(img), egui::TextureOptions::NEAREST);
+        self.image_tex = Some((sel, tex));
+    }
+}
+
+/// Map the image values through the colormap. Sides beyond the texture
+/// limit are subsampled; NaN pixels are grey.
+fn color_image(img: &Image2D) -> egui::ColorImage {
+    const MAX_SIDE: usize = 4096;
+    let stride = |n: usize| n.div_ceil(MAX_SIDE).max(1);
+    let (sx, sy) = (stride(img.cols), stride(img.rows));
+    let (w, h) = (img.cols.div_ceil(sx), img.rows.div_ceil(sy));
+    let span = (img.vmax - img.vmin).abs().max(f64::MIN_POSITIVE);
+    let mut pixels = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            let v = img.data[j * sy * img.cols + i * sx];
+            pixels.push(if v.is_finite() {
+                viridis(((v - img.vmin) / span) as f32)
+            } else {
+                Color32::from_gray(110)
+            });
+        }
+    }
+    egui::ColorImage::new([w, h], pixels)
+}
+
+/// Matplotlib's viridis colormap, interpolated between its decile anchors.
+fn viridis(t: f32) -> Color32 {
+    const ANCHORS: [[u8; 3]; 11] = [
+        [68, 1, 84],
+        [72, 36, 117],
+        [65, 68, 135],
+        [53, 95, 141],
+        [42, 120, 142],
+        [33, 145, 140],
+        [34, 168, 132],
+        [68, 191, 112],
+        [122, 209, 81],
+        [189, 223, 38],
+        [253, 231, 37],
+    ];
+    let t = t.clamp(0.0, 1.0) * 10.0;
+    let i = (t.floor() as usize).min(9);
+    let f = t - i as f32;
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+    let (a, b) = (ANCHORS[i], ANCHORS[i + 1]);
+    Color32::from_rgb(mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2]))
 }
 
 fn load_node(tree: &Tree, file: usize, idx: usize) -> Loaded {
@@ -835,6 +1097,7 @@ fn load_node(tree: &Tree, file: usize, idx: usize) -> Loaded {
         points: Vec::new(),
         x_label: "index".to_string(),
         stats: None,
+        image: None,
     };
     loaded.units = loaded
         .attrs
@@ -872,22 +1135,139 @@ fn load_node(tree: &Tree, file: usize, idx: usize) -> Loaded {
             }
             loaded.points = decimate(loaded.x.as_deref(), data);
             loaded.y = data.clone();
+        } else if let [rows, cols] = squeezed[..] {
+            loaded.image = Some(build_image(tree, node.parent, data, rows, cols));
         }
     }
     loaded
+}
+
+fn build_image(tree: &Tree, parent: usize, data: &[f64], rows: usize, cols: usize) -> Image2D {
+    let (mut vmin, mut vmax, mut n_nan) = (f64::INFINITY, f64::NEG_INFINITY, 0);
+    for &v in data {
+        if v.is_finite() {
+            vmin = vmin.min(v);
+            vmax = vmax.max(v);
+        } else {
+            n_nan += 1;
+        }
+    }
+    if vmin > vmax {
+        (vmin, vmax) = (0.0, 0.0);
+    }
+    let mut img = Image2D {
+        rows,
+        cols,
+        data: data.to_vec(),
+        vmin,
+        vmax,
+        n_nan,
+        x0: 0.0,
+        dx: 1.0,
+        y0: 0.0,
+        dy: 1.0,
+        has_edges: false,
+        x_label: "column".into(),
+        y_label: "row".into(),
+    };
+    // Sibling bin edges (x_edges: cols + 1, y_edges: rows + 1) place the
+    // image in physical coordinates when both are uniformly spaced.
+    let edges = |name: &str, n: usize| -> Option<((f64, f64), String)> {
+        let idx = tree.child_named(parent, name)?;
+        let ds = tree.file.dataset(&tree.nodes[idx].path).ok()?;
+        let Value::Numeric { data: e, .. } = h5io::read_container(&ds) else { return None };
+        if e.len() != n + 1 || !uniform_ascending(&e) {
+            return None;
+        }
+        let units = h5io::read_attributes(&tree.file, &tree.nodes[idx].path)
+            .into_iter()
+            .find(|(k, _)| k == "units")
+            .map(|(_, u)| format!(" ({u})"))
+            .unwrap_or_default();
+        Some(((e[0], e[n]), units))
+    };
+    if let (Some((xr, xu)), Some((yr, yu))) = (edges("x_edges", cols), edges("y_edges", rows)) {
+        img.x0 = xr.0;
+        img.dx = (xr.1 - xr.0) / cols as f64;
+        img.y0 = yr.0;
+        img.dy = (yr.1 - yr.0) / rows as f64;
+        img.has_edges = true;
+        img.x_label = format!("x{xu}");
+        img.y_label = format!("y{yu}");
+    }
+    img
+}
+
+/// Strictly increasing with (nearly) equal steps.
+fn uniform_ascending(e: &[f64]) -> bool {
+    if e.len() < 2 {
+        return false;
+    }
+    let step = (e[e.len() - 1] - e[0]) / (e.len() - 1) as f64;
+    step > 0.0
+        && e.windows(2)
+            .all(|w| ((w[1] - w[0]) - step).abs() <= 1e-6 * step.abs())
+}
+
+/// Groups under `top` holding a 2-D numeric dataset called `name`
+/// (e.g. every tag under `projections` with a `strain` map).
+fn sibling_images(tree: &Tree, top: &h5io::Node, name: &str) -> Vec<(usize, usize)> {
+    top.children
+        .iter()
+        .filter(|&&g| tree.nodes[g].is_group)
+        .filter_map(|&g| {
+            let d = tree.child_named(g, name)?;
+            let shape = &tree.nodes[d].shape;
+            (shape.iter().filter(|&&s| s > 1).count() == 2).then_some((g, d))
+        })
+        .collect()
+}
+
+/// Write every sibling image as `<out_dir>/<tag>.tiff`; returns the count
+/// written and the tags that failed (with the reason).
+fn export_siblings(tree: &Tree, top: &h5io::Node, name: &str, out_dir: &Path) -> (usize, Vec<String>) {
+    let mut n = 0;
+    let mut failures = Vec::new();
+    for (g, d) in sibling_images(tree, top, name) {
+        let tag = &tree.nodes[g].name;
+        let result = tree
+            .file
+            .dataset(&tree.nodes[d].path)
+            .map_err(anyhow::Error::from)
+            .and_then(|ds| match h5io::read_container(&ds) {
+                Value::Numeric { data, shape } => {
+                    let dims: Vec<usize> = shape.into_iter().filter(|&s| s > 1).collect();
+                    export::write_tiff(&out_dir.join(format!("{tag}.tiff")), dims[0], dims[1], &data)
+                }
+                Value::Unsupported(m) => Err(anyhow::anyhow!(m)),
+                _ => Err(anyhow::anyhow!("not numeric")),
+            });
+        match result {
+            Ok(()) => n += 1,
+            Err(e) => failures.push(format!("{tag} ({e:#})")),
+        }
+    }
+    (n, failures)
 }
 
 fn compute_stats(data: &[f64]) -> Option<Stats> {
     if data.is_empty() {
         return None;
     }
-    let (mut min, mut max, mut sum) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
+    // NaN entries (bad fits) are left out of min/max/mean.
+    let (mut min, mut max, mut sum, mut n_finite) = (f64::INFINITY, f64::NEG_INFINITY, 0.0, 0usize);
     for &v in data {
-        min = min.min(v);
-        max = max.max(v);
-        sum += v;
+        if v.is_finite() {
+            min = min.min(v);
+            max = max.max(v);
+            sum += v;
+            n_finite += 1;
+        }
     }
-    Some(Stats { n: data.len(), min, max, mean: sum / data.len() as f64 })
+    if n_finite == 0 {
+        (min, max) = (f64::NAN, f64::NAN);
+    }
+    Some(Stats { n: data.len(), min, max, mean: sum / n_finite.max(1) as f64 })
 }
 
 /// Turn (x, y) series into plot points, min/max-decimated so huge arrays stay
@@ -935,6 +1315,11 @@ impl eframe::App for App {
             )
         });
         if !dropped.is_empty() {
+            logger::log(format!(
+                "Dropped {} file(s){}",
+                dropped.len(),
+                if ctrl { " [Ctrl: added]" } else { "" }
+            ));
             self.enqueue_opens(dropped, ctrl);
         }
         self.process_pending(&ctx);
@@ -1065,9 +1450,11 @@ impl App {
                 .on_hover_text("Reopen one of the last files");
             });
             if let Some((p, add)) = reopen {
+                logger::log(format!("Recent: picked {}", p.display()));
                 self.open_file(&p, ctx, add);
             }
             if clear_recent {
+                logger::log("Recent list cleared");
                 recent::clear(&mut self.recent);
             }
         });
@@ -1404,6 +1791,7 @@ impl App {
             }
         }
         if uncheck_all {
+            logger::log("Recent PVs: uncheck all");
             self.selected = None;
             self.loaded = None;
             self.others.clear();
@@ -1411,23 +1799,36 @@ impl App {
             self.xy_cache = None;
         }
         if clear {
+            logger::log("Recent PVs cleared");
             recent::clear_pvs(&mut self.recent_pvs);
         }
     }
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         self.ensure_xy_cache();
+        self.ensure_image_texture(ui.ctx());
         let mut mode = self.compare_mode;
         let mut swap = self.swap_xy;
         let mut norm = self.normalize;
         let mut remove_other: Option<usize> = None;
+        let mut export: Option<Export> = None;
         let mut dismiss_error = false;
+        let mut dismiss_notice = false;
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = &self.error {
                 ui.horizontal(|ui| {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                     if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
                         dismiss_error = true;
+                    }
+                });
+                ui.separator();
+            }
+            if let Some(note) = &self.notice {
+                ui.horizontal(|ui| {
+                    ui.label(note);
+                    if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
+                        dismiss_notice = true;
                     }
                 });
                 ui.separator();
@@ -1457,9 +1858,20 @@ impl App {
                 .id_salt("dataset_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    self.dataset_content(ui, panel_h, &mut mode, &mut swap, &mut norm, &mut remove_other);
+                    self.dataset_content(
+                        ui, panel_h, &mut mode, &mut swap, &mut norm, &mut remove_other, &mut export,
+                    );
                 });
         });
+        if mode != self.compare_mode {
+            logger::log(format!("Compare mode: {mode:?}"));
+        }
+        if swap != self.swap_xy {
+            logger::log(format!("Swap axes: {swap}"));
+        }
+        if norm != self.normalize {
+            logger::log(format!("Normalize [0–1]: {norm}"));
+        }
         self.compare_mode = mode;
         self.swap_xy = swap;
         self.normalize = norm;
@@ -1468,6 +1880,112 @@ impl App {
         }
         if dismiss_error {
             self.error = None;
+        }
+        if dismiss_notice {
+            self.notice = None;
+        }
+        if let Some(kind) = export {
+            self.run_export(kind);
+        }
+    }
+
+    /// File dialog, then write; the outcome lands in `notice` or `error`.
+    fn run_export(&mut self, kind: Export) {
+        let Some(loaded) = &self.loaded else { return };
+        let tree = &self.files[loaded.file].tree;
+        let node = &tree.nodes[loaded.node];
+        let parent = &tree.nodes[node.parent];
+        // Images are named after the group holding the dataset (the tag,
+        // e.g. `000`); a dataset at the file root keeps its own name.
+        let tag = if node.parent == 0 { node.name.clone() } else { parent.name.clone() };
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = self.default_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        self.error = None;
+        self.notice = None;
+        logger::log(format!(
+            "Export {kind:?} clicked for {} {}",
+            self.file_label(loaded.file),
+            node.path
+        ));
+        let result: anyhow::Result<Option<String>> = match kind {
+            Export::Csv => {
+                let Some(path) = dialog
+                    .set_file_name(format!("{}.csv", loaded.label))
+                    .add_filter("CSV", &["csv"])
+                    .save_file()
+                else {
+                    logger::log("Export CSV: dialog cancelled");
+                    return;
+                };
+                let value_head = match &loaded.units {
+                    Some(u) => format!("{} ({u})", loaded.label),
+                    None => loaded.label.clone(),
+                };
+                let index: Vec<f64> = (0..loaded.y.len()).map(|i| i as f64).collect();
+                let mut header = vec!["index"];
+                let mut columns: Vec<&[f64]> = vec![&index];
+                if let Some(t) = &loaded.x {
+                    header.push(&loaded.x_label);
+                    columns.push(t);
+                }
+                header.push(&value_head);
+                columns.push(&loaded.y);
+                export::write_csv(&path, &header, &columns)
+                    .map(|()| Some(format!("Wrote {} rows to {}", loaded.y.len(), path.display())))
+            }
+            Export::Tiff => {
+                let Some(img) = &loaded.image else { return };
+                let Some(path) = dialog
+                    .set_file_name(format!("{tag}.tiff"))
+                    .add_filter("TIFF", &["tiff", "tif"])
+                    .save_file()
+                else {
+                    logger::log("Export TIFF: dialog cancelled");
+                    return;
+                };
+                export::write_tiff(&path, img.rows, img.cols, &img.data)
+                    .map(|()| Some(format!("Wrote {}×{} image to {}", img.rows, img.cols, path.display())))
+            }
+            Export::TiffAll => {
+                let Some(dir) = dialog.pick_folder() else {
+                    logger::log("Export all TIFF: dialog cancelled");
+                    return;
+                };
+                let top = &tree.nodes[parent.parent];
+                let folder = if parent.parent == 0 {
+                    tree.file_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "export".into())
+                } else {
+                    top.name.clone()
+                };
+                let out_dir = dir.join(&folder);
+                std::fs::create_dir_all(&out_dir)
+                    .with_context(|| format!("cannot create {}", out_dir.display()))
+                    .and_then(|()| {
+                        let (n, failures) = export_siblings(tree, top, &node.name, &out_dir);
+                        let mut msg = format!("Wrote {n} TIFF image(s) to {}", out_dir.display());
+                        if !failures.is_empty() {
+                            msg.push_str(&format!("; skipped: {}", failures.join(", ")));
+                        }
+                        Ok(Some(msg))
+                    })
+            }
+        };
+        match result {
+            Ok(msg) => {
+                if let Some(m) = &msg {
+                    logger::log(format!("Export: {m}"));
+                }
+                self.notice = msg;
+            }
+            Err(e) => {
+                logger::error(format!("Export failed: {e:#}"));
+                self.error = Some(format!("Export failed: {e:#}"));
+            }
         }
     }
 
@@ -1482,6 +2000,7 @@ impl App {
         swap: &mut bool,
         norm: &mut bool,
         remove_other: &mut Option<usize>,
+        export: &mut Option<Export>,
     ) {
         let Some(loaded) = &self.loaded else { return };
         let many = self.files.len() > 1;
@@ -1600,10 +2119,46 @@ impl App {
                 .weak(),
             );
         } else {
-            ui.label(
-                RichText::new(format!("dtype: {}   shape: {:?}", node.dtype, node.shape))
-                    .weak(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("dtype: {}   shape: {:?}", node.dtype, node.shape))
+                        .weak(),
+                );
+                if loaded.plottable() {
+                    if ui.small_button("💾 CSV…").on_hover_text("Save the values as a CSV file").clicked() {
+                        *export = Some(Export::Csv);
+                    }
+                }
+                if loaded.image.is_some() {
+                    if ui
+                        .small_button("💾 TIFF…")
+                        .on_hover_text("Save this image as a 32-bit float TIFF")
+                        .clicked()
+                    {
+                        *export = Some(Export::Tiff);
+                    }
+                    if node.parent != 0 {
+                        let parent = &tree.nodes[node.parent];
+                        let top = &tree.nodes[parent.parent];
+                        let siblings = sibling_images(tree, top, &node.name).len();
+                        if siblings > 1 {
+                            let top_name = if parent.parent == 0 { "the file root" } else { &top.name };
+                            if ui
+                                .small_button(format!("💾 all {siblings} '{}' under {top_name}…", node.name))
+                                .on_hover_text(format!(
+                                    "Save the '{}' image of every group under {top_name} as \
+                                     <folder>/{}/<group>.tiff",
+                                    node.name,
+                                    if parent.parent == 0 { "<file name>" } else { &top.name }
+                                ))
+                                .clicked()
+                            {
+                                *export = Some(Export::TiffAll);
+                            }
+                        }
+                    }
+                }
+            });
         }
 
         if node.is_group && loaded.attrs.is_empty() {
@@ -1658,6 +2213,8 @@ impl App {
                     );
                 } else if !loaded.points.is_empty() {
                     show_plot(ui, loaded, panel_h);
+                } else if let (Some(img), Some((_, tex))) = (&loaded.image, &self.image_tex) {
+                    show_image(ui, loaded, img, tex, panel_h);
                 } else {
                     ui.label(format!(
                         "{}-D array {:?} — plotting supports 1-D data. First values:",
@@ -1824,6 +2381,109 @@ mod run_range_tests {
         assert_eq!(trailing_number("run42"), Some(42));
         assert_eq!(trailing_number("VENUS_"), None);
         assert_eq!(trailing_number(""), None);
+    }
+
+    #[test]
+    fn image_axes_read_top_down() {
+        let img = Image2D {
+            rows: 3,
+            cols: 4,
+            data: (0..12).map(|v| v as f64).collect(),
+            vmin: 0.0,
+            vmax: 11.0,
+            n_nan: 0,
+            x0: 100.0,
+            dx: 10.0,
+            y0: 50.0,
+            dy: 5.0,
+            has_edges: true,
+            x_label: String::new(),
+            y_label: String::new(),
+        };
+        // Row 0 spans y 50–55, drawn at the top: plot y = -52.
+        assert_eq!(img.pick(PlotPoint::new(101.0, -52.0)), Some((0, 0, 0.0)));
+        assert_eq!(img.pick(PlotPoint::new(139.0, -64.0)), Some((3, 2, 11.0)));
+        assert_eq!(img.pick(PlotPoint::new(141.0, -52.0)), None);
+        assert_eq!(img.pick(PlotPoint::new(101.0, -49.0)), None);
+        let c = img.center();
+        assert_eq!((c.x, c.y), (120.0, -57.5));
+        assert_eq!(img.size(), egui::Vec2::new(40.0, 15.0));
+    }
+
+    const STRAIN_FILE: &str = "/gpfs/neutronsfs/instruments/VENUS/IPTS-37480/shared/Xiaohan/Strain_2D_along_different_directions/strain_3d_110_y2026_m09_d22_h13_mn05.h5";
+
+    #[test]
+    fn export_every_strain_map() {
+        let Ok(tree) = h5io::load(Path::new(STRAIN_FILE)) else {
+            eprintln!("strain sample file not available, skipping");
+            return;
+        };
+        let strain = tree.node_by_path("/projections/000/strain").unwrap();
+        let parent = tree.nodes[strain].parent;
+        let top = &tree.nodes[tree.nodes[parent].parent];
+        assert_eq!(top.name, "projections");
+        let siblings = sibling_images(&tree, top, "strain");
+        assert_eq!(siblings.len(), 51);
+        // x_edges is 1-D: no images.
+        assert!(sibling_images(&tree, top, "x_edges").is_empty());
+
+        let dir = std::env::temp_dir().join(format!("nexus_viewer_strain_{}", std::process::id()));
+        let out = dir.join(&top.name);
+        std::fs::create_dir_all(&out).unwrap();
+        let (n, failures) = export_siblings(&tree, top, "strain", &out);
+        assert_eq!((n, failures.len()), (51, 0));
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names[0], "000.tiff");
+        assert_eq!(names[50], "050.tiff");
+        // The first pixel of tag 002 (an 11×10 map) survives the round trip.
+        let ds = tree.file.dataset("/projections/002/strain").unwrap();
+        let Value::Numeric { data, shape } = h5io::read_container(&ds) else { panic!() };
+        let mut dec = tiff::decoder::Decoder::new(std::fs::File::open(out.join("002.tiff")).unwrap()).unwrap();
+        assert_eq!(dec.dimensions().unwrap(), (shape[1] as u32, shape[0] as u32));
+        let tiff::decoder::DecodingResult::F32(px) = dec.read_image().unwrap() else { panic!() };
+        assert_eq!(px.len(), data.len());
+        assert_eq!(px[0], data[0] as f32);
+        assert_eq!(px[px.len() - 1], data[data.len() - 1] as f32);
+        // NEXUS_VIEWER_KEEP_EXPORT=1 keeps the files for a look with another reader.
+        if std::env::var_os("NEXUS_VIEWER_KEEP_EXPORT").is_none() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        } else {
+            eprintln!("kept {}", out.display());
+        }
+    }
+
+    #[test]
+    fn tick_labels() {
+        assert_eq!(tick_label(-0.0, 10.0), "0");
+        assert_eq!(tick_label(300.0, 50.0), "300");
+        assert_eq!(tick_label(2.5, 0.5), "2.5");
+        assert_eq!(tick_label(0.75, 0.025), "0.75");
+    }
+
+    #[test]
+    fn uniform_edges() {
+        assert!(uniform_ascending(&[0.0, 1.0, 2.0, 3.0]));
+        assert!(uniform_ascending(&[100.0, 130.0, 160.0]));
+        assert!(!uniform_ascending(&[0.0, 1.0, 3.0]));
+        assert!(!uniform_ascending(&[3.0, 2.0, 1.0]));
+        assert!(!uniform_ascending(&[1.0]));
+    }
+
+    #[test]
+    fn viridis_ends() {
+        assert_eq!(viridis(0.0), Color32::from_rgb(68, 1, 84));
+        assert_eq!(viridis(1.0), Color32::from_rgb(253, 231, 37));
+        assert_eq!(viridis(2.0), Color32::from_rgb(253, 231, 37));
+    }
+
+    #[test]
+    fn stats_skip_nan() {
+        let s = compute_stats(&[1.0, f64::NAN, 3.0]).unwrap();
+        assert_eq!((s.n, s.min, s.max, s.mean), (3, 1.0, 3.0, 2.0));
     }
 
     #[test]
@@ -2096,21 +2756,227 @@ fn series_label(l: &Loaded) -> String {
     }
 }
 
+/// A 1-D array: its plot, with the values listed in a table beside it.
 fn show_plot(ui: &mut egui::Ui, loaded: &Loaded, panel_h: f32) {
     if let Some(s) = &loaded.stats {
         stats_line(ui, "", s);
     }
     let y_label = series_label(loaded);
     ui.add_space(4.0);
+    let h = plot_height(ui, panel_h);
     let line = Line::new(y_label.clone(), PlotPoints::from(loaded.points.clone()));
-    Plot::new("dataset_plot")
-        .x_axis_label(loaded.x_label.clone())
-        .y_axis_label(y_label)
-        .allow_boxed_zoom(true)
-        .height(plot_height(ui, panel_h))
-        .show(ui, |plot_ui| {
-            plot_ui.line(line);
+    ui.horizontal_top(|ui| {
+        let table = ValueTable::new(loaded);
+        let gap = ui.spacing().item_spacing.x;
+        let plot_w = (ui.available_width() - table.width(ui) - gap).max(200.0);
+        Plot::new("dataset_plot")
+            .x_axis_label(loaded.x_label.clone())
+            .y_axis_label(y_label)
+            .allow_boxed_zoom(true)
+            .width(plot_w)
+            .height(h)
+            .show(ui, |plot_ui| {
+                plot_ui.line(line);
+            });
+        table.show(ui, h);
+    });
+}
+
+/// The values of a 1-D array as text rows: index, sibling time when there
+/// is one, value. Only the visible rows are laid out, so long PV logs stay
+/// cheap.
+struct ValueTable<'a> {
+    y: &'a [f64],
+    x: Option<&'a [f64]>,
+    header: String,
+    /// Column widths in characters: index, time.
+    iw: usize,
+    tw: usize,
+}
+
+impl<'a> ValueTable<'a> {
+    fn new(loaded: &'a Loaded) -> Self {
+        let y = &loaded.y;
+        let x = loaded.x.as_deref();
+        let iw = y.len().saturating_sub(1).to_string().len().max(5);
+        let tw = x
+            .map(|x| x.iter().map(|v| format_num(*v).len()).max().unwrap_or(0).max(loaded.x_label.len()))
+            .unwrap_or(0);
+        let value_head = match &loaded.units {
+            Some(u) => format!("value ({u})"),
+            None => "value".to_string(),
+        };
+        let header = match x {
+            Some(_) => format!("{:>iw$}  {:>tw$}  {value_head}", "index", loaded.x_label),
+            None => format!("{:>iw$}  {value_head}", "index"),
+        };
+        Self { y, x, header, iw, tw }
+    }
+
+    fn row(&self, i: usize) -> String {
+        let (iw, tw) = (self.iw, self.tw);
+        match self.x {
+            Some(x) => format!("{i:>iw$}  {:>tw$}  {}", format_num(x[i]), format_num(self.y[i])),
+            None => format!("{i:>iw$}  {}", format_num(self.y[i])),
+        }
+    }
+
+    /// Width in points: the longest line plus room for the scroll bar.
+    fn width(&self, ui: &egui::Ui) -> f32 {
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let glyph = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
+        let value_w = self.y.iter().take(5000).map(|v| format_num(*v).len()).max().unwrap_or(0);
+        let chars = self.header.len().max(self.iw + 2 + if self.x.is_some() { self.tw + 2 } else { 0 } + value_w);
+        (chars as f32 + 1.0) * glyph + 24.0
+    }
+
+    fn show(&self, ui: &mut egui::Ui, height: f32) {
+        let width = self.width(ui);
+        ui.vertical(|ui| {
+            ui.set_width(width);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} values", self.y.len())).weak());
+                if ui.small_button("📋").on_hover_text("Copy all values (tab-separated)").clicked() {
+                    let mut text = self.header.split_whitespace().collect::<Vec<_>>().join("\t");
+                    // The value header may hold a space ("value (degree)").
+                    text = match self.x {
+                        Some(_) => text.splitn(3, '\t').collect::<Vec<_>>().join("\t"),
+                        None => text.splitn(2, '\t').collect::<Vec<_>>().join("\t"),
+                    };
+                    text.push('\n');
+                    for i in 0..self.y.len() {
+                        let row = match self.x {
+                            Some(x) => format!("{i}\t{}\t{}", format_num(x[i]), format_num(self.y[i])),
+                            None => format!("{i}\t{}", format_num(self.y[i])),
+                        };
+                        text.push_str(&row);
+                        text.push('\n');
+                    }
+                    ui.ctx().copy_text(text);
+                }
+            });
+            ui.label(RichText::new(&self.header).monospace().strong());
+            let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+            let used = ui.min_rect().height() + ui.spacing().item_spacing.y;
+            egui::ScrollArea::vertical()
+                .id_salt("value_table")
+                .max_height((height - used).max(60.0))
+                .auto_shrink([false, false])
+                .show_rows(ui, row_h, self.y.len(), |ui, range| {
+                    for i in range {
+                        ui.label(RichText::new(self.row(i)).monospace());
+                    }
+                });
         });
+    }
+}
+
+/// A 2-D array as a false-colour image (viridis) with a colour bar; hovering
+/// reads the pixel under the pointer.
+fn show_image(ui: &mut egui::Ui, loaded: &Loaded, img: &Image2D, tex: &egui::TextureHandle, panel_h: f32) {
+    if let Some(s) = &loaded.stats {
+        stats_line(ui, "", s);
+    }
+    let units = loaded.units.as_deref().unwrap_or("");
+    let mut note = format!("{} rows × {} columns", img.rows, img.cols);
+    if img.n_nan > 0 {
+        note.push_str(&format!(" — {} NaN (grey)", img.n_nan));
+    }
+    ui.label(RichText::new(note).weak());
+    ui.add_space(4.0);
+    let readout_h = ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y;
+    let h = (plot_height(ui, panel_h) - readout_h).max(160.0);
+    let bar_w = 90.0;
+    let picked = ui
+        .horizontal_top(|ui| {
+            let plot_w = (ui.available_width() - bar_w - ui.spacing().item_spacing.x).max(200.0);
+            let image = PlotImage::new(loaded.label.clone(), tex.id(), img.center(), img.size());
+            let picked = Plot::new("dataset_image")
+                .x_axis_label(img.x_label.clone())
+                .y_axis_label(img.y_label.clone())
+                .y_axis_formatter(|mark, _| tick_label(-mark.value, mark.step_size))
+                .data_aspect(1.0)
+                .allow_boxed_zoom(true)
+                .width(plot_w)
+                .height(h)
+                .show(ui, |plot_ui| {
+                    plot_ui.image(image);
+                    let hovered = plot_ui.response().hovered();
+                    plot_ui.pointer_coordinate().filter(|_| hovered).and_then(|p| img.pick(p))
+                })
+                .inner;
+            colorbar(ui, img, units, bar_w, h);
+            picked
+        })
+        .inner;
+    let text = match picked {
+        Some((c, r, v)) if img.has_edges => format!(
+            "column {c}, row {r}  (x {}–{}, y {}–{}):  {} {units}",
+            tick_label(img.x0 + c as f64 * img.dx, img.dx),
+            tick_label(img.x0 + (c + 1) as f64 * img.dx, img.dx),
+            tick_label(img.y0 + r as f64 * img.dy, img.dy),
+            tick_label(img.y0 + (r + 1) as f64 * img.dy, img.dy),
+            format_num(v)
+        ),
+        Some((c, r, v)) => format!("column {c}, row {r}:  {} {units}", format_num(v)),
+        None => "hover the image to read a pixel".to_string(),
+    };
+    ui.label(RichText::new(text).monospace());
+}
+
+/// Axis tick text: as many decimals as the tick spacing needs.
+fn tick_label(v: f64, step: f64) -> String {
+    let decimals = if step > 0.0 { (-step.log10().floor()).max(0.0) as usize } else { 0 };
+    let v = if v == 0.0 { 0.0 } else { v }; // no "-0"
+    format!("{v:.decimals$}")
+}
+
+/// Vertical viridis strip with the colour range printed at both ends.
+fn colorbar(ui: &mut egui::Ui, img: &Image2D, units: &str, width: f32, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(width, height), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let text_h = ui.text_style_height(&egui::TextStyle::Small) + 2.0;
+    let color = ui.visuals().text_color();
+    let strip = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 4.0, rect.top() + text_h),
+        egui::pos2(rect.left() + 22.0, rect.bottom() - text_h),
+    );
+    const BANDS: usize = 64;
+    let band_h = strip.height() / BANDS as f32;
+    for b in 0..BANDS {
+        let t = 1.0 - (b as f32 + 0.5) / BANDS as f32;
+        let top = strip.top() + b as f32 * band_h;
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(strip.left(), top), egui::pos2(strip.right(), top + band_h + 0.5)),
+            0.0,
+            viridis(t),
+        );
+    }
+    painter.rect_stroke(strip, 0.0, egui::Stroke::new(1.0, color.gamma_multiply(0.5)), egui::StrokeKind::Outside);
+    painter.text(
+        egui::pos2(strip.left(), strip.top() - 2.0),
+        egui::Align2::LEFT_BOTTOM,
+        format_num(img.vmax),
+        font.clone(),
+        color,
+    );
+    painter.text(
+        egui::pos2(strip.left(), strip.bottom() + 2.0),
+        egui::Align2::LEFT_TOP,
+        format_num(img.vmin),
+        font.clone(),
+        color,
+    );
+    if !units.is_empty() {
+        painter.text(
+            egui::pos2(strip.right() + 6.0, strip.center().y),
+            egui::Align2::LEFT_CENTER,
+            units,
+            font,
+            color,
+        );
+    }
 }
 
 /// Pair the two selected PVs into (x, y) points. PVs logged at different
